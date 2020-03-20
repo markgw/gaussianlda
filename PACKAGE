@@ -1,0 +1,13 @@
+# To build and distribute this package, do the following
+# These instructions are really just a short form of those here:
+#  https://packaging.python.org/tutorials/packaging-projects/
+
+# Set up a virtualenv in venv
+# Make sure setuptools, wheel and twine are installed and up to date
+./venv/bin/python -m pip install --upgrade setuptools wheel twine
+
+# Build the wheel
+./venv/bin/python3 setup.py sdist bdist_wheel
+# Upload the package to Pypi
+./venv/bin/python3 -m twine upload dist/*
+# Use the username __token__ and as the password use the generated API token

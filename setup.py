@@ -1,6 +1,6 @@
 from os import path
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 here = path.abspath(path.dirname(__file__))
 
@@ -11,7 +11,7 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
 
 setup(
     name='gaussianlda',
-    version='0.1',
+    version='0.1.4',
     description='Implementation of Gaussian LDA topic model, with efficiency tricks',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -28,9 +28,10 @@ setup(
         'Programming Language :: Python :: 3 :: Only',
     ],
     keywords='gaussian lda topic-model machine-learning',
+    packages=find_packages('src'),
     package_dir={'': 'src'},
     python_requires='>=3.2',
-    install_requires=['numpy', 'scipy', 'Cython', 'choldate', 'progressbar'],
+    install_requires=['numpy', 'scipy', 'Cython', 'progressbar', 'choldate'],
     project_urls={
         'Based on': 'https://github.com/rajarshd/Gaussian_LDA',
         'Funding': 'https://www.newseye.eu/',

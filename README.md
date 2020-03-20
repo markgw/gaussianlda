@@ -8,8 +8,11 @@ released by the paper's authors.
 
 ## Installation
 
-Install using Pip from Github:
+You'll first need to install the ``choldate`` package, [following its installation 
+instructions](https://github.com/modusdatascience/choldate). (It's not 
+possible to include this as a dependency for the PyPi package.)
 
+Then install gaussianlda using Pip:
 ```
 pip install gaussianlda
 ```
