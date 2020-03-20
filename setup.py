@@ -31,7 +31,7 @@ setup(
     package_dir={'': 'src'},
     python_requires='>=3.2',
     install_requires=['numpy', 'scipy', 'Cython', 'choldate', 'progressbar'],
-    project_urls={  # Optional
+    project_urls={
         'Based on': 'https://github.com/rajarshd/Gaussian_LDA',
         'Funding': 'https://www.newseye.eu/',
     },
