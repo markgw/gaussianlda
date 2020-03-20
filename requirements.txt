@@ -1,0 +1,5 @@
+numpy
+scipy
+Cython
+git+git://github.com/jcrudy/choldate.git
+progressbar
