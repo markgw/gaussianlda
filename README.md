@@ -11,7 +11,7 @@ released by the paper's authors.
 Install using Pip from Github:
 
 ```
-pip install git+git://github.com/markgw/gaussianlda.git
+pip install gaussianlda
 ```
 
 ## Usage
