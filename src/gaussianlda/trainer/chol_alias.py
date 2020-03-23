@@ -329,20 +329,32 @@ class GaussianLDAAliasTrainer:
                         # Just update params for this customer
                         self.update_table_params(old_table_id, cust_id, is_removed=True)
 
+                        # Avoid recomputing the same probability multiple times
+                        _table_ll = {}
+                        def _get_table_ll(tab):
+                            if tab not in _table_ll:
+                                _table_ll[tab] = self.log_multivariate_tdensity(x, tab)
+                            return _table_ll[tab]
+
                         # Under the alias method, we only do the full likelihood computation for topics
                         # that already have a non-zero count in the current document
                         non_zero_tables = np.where(self.table_counts_per_doc[:, d] > 0)[0]
-                        # We only compute the posterior for these topics
-                        posterior = np.zeros(len(non_zero_tables), dtype=np.float32)
-                        for nz_table, table in enumerate(non_zero_tables):
-                            log_likelihood = self.log_multivariate_tdensity(x, table)
-                            posterior[nz_table] = np.log(self.table_counts_per_doc[table, d]) + log_likelihood
+                        if len(non_zero_tables) == 0:
+                            no_non_zero = True
+                        else:
+                            no_non_zero = True
 
-                        # To prevent overflow, subtract by log(p_max)
-                        posterior -= posterior.max()
-                        posterior = np.exp(posterior)
-                        psum = posterior.sum()
-                        posterior /= psum
+                            # We only compute the posterior for these topics
+                            posterior = np.zeros(len(non_zero_tables), dtype=np.float32)
+                            for nz_table, table in enumerate(non_zero_tables):
+                                log_likelihood = _get_table_ll(table)
+                                posterior[nz_table] = np.log(self.table_counts_per_doc[table, d]) + log_likelihood
+
+                            # To prevent overflow, subtract by log(p_max)
+                            posterior -= posterior.max()
+                            posterior = np.exp(posterior)
+                            psum = posterior.sum()
+                            posterior /= psum
 
                         # Don't let the alias parameters get updated in the middle of the sampling
                         alias = self.aliases[cust_id]
@@ -351,40 +363,44 @@ class GaussianLDAAliasTrainer:
 
                             # MHV to draw new topic
                             # Take a number of Metropolis-Hastings samples
+                            current_sample = old_table_id
                             for r in range(self.mh_steps):
                                 # 1. Flip a coin
-                                if np.random.sample() < select_pr:
+                                if not no_non_zero and np.random.sample() < select_pr:
                                     # Choose from the computed posterior dist
                                     temp = np.random.choice(len(non_zero_tables), p=posterior)
                                     new_table_id = non_zero_tables[temp]
                                 else:
                                     new_table_id = alias.sample_vose()
 
-                                if new_table_id != old_table_id:
+                                if new_table_id != current_sample:
                                     # 2. Find acceptance probability
-                                    old_prob = self.log_multivariate_tdensity(x, old_table_id)
-                                    new_prob = self.log_multivariate_tdensity(x, new_table_id)
-                                    acceptance = \
-                                        (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
-                                        (self.table_counts_per_doc[old_table_id, d] + self.alpha) * \
-                                        np.exp(new_prob - old_prob) * \
-                                        (self.table_counts_per_doc[old_table_id, d]*old_prob +
-                                         self.alpha*alias.w.np[old_table_id]) / \
-                                        (self.table_counts_per_doc[new_table_id, d]*new_prob +
-                                         self.alpha*alias.w.np[new_table_id])
+                                    old_prob = _get_table_ll(current_sample)
+                                    new_prob = _get_table_ll(new_table_id)
+                                    # This can sometimes generate an overflow warning from Numpy
+                                    # We don't care, though: in that case acceptance > 1., so we always accept
+                                    with np.errstate(over="ignore"):
+                                        acceptance = \
+                                            (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
+                                            (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                            np.exp(new_prob - old_prob) * \
+                                            (self.table_counts_per_doc[current_sample, d]*old_prob +
+                                             self.alpha*alias.w.np[current_sample]) / \
+                                            (self.table_counts_per_doc[new_table_id, d]*new_prob +
+                                             self.alpha*alias.w.np[new_table_id])
                                     # 3. Compare against uniform[0,1]
-                                    if np.random.sample() < acceptance:
+                                    if np.random.sample() < min(1., acceptance):
                                         # This seems puzzling, but follows the Java impl exactly...
-                                        old_table_id = new_table_id
+                                        current_sample = new_table_id
 
                         # Now have a new assignment: add its counts
-                        self.table_assignments[d][w] = new_table_id
+                        self.table_assignments[d][w] = current_sample
                         with self.table_counts.lock:
-                            self.table_counts.np[new_table_id] += 1
-                        self.table_counts_per_doc[new_table_id, d] += 1
-                        self.sum_squared_table_customers[new_table_id] += np.outer(x, x)
+                            self.table_counts.np[current_sample] += 1
+                        self.table_counts_per_doc[current_sample, d] += 1
+                        self.sum_squared_table_customers[current_sample] += np.outer(x, x)
 
-                        self.update_table_params(new_table_id, cust_id)
+                        self.update_table_params(current_sample, cust_id)
 
                 # Pause the alias updater until we start the next iteration
                 alias_updater.pause()

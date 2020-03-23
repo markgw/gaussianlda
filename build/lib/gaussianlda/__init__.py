@@ -1,2 +1,0 @@
-from gaussianlda.trainer.chol import GaussianLDATrainer
-from gaussianlda.trainer.chol_alias import GaussianLDAAliasTrainer
