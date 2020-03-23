@@ -92,11 +92,7 @@ class GaussianLDAAliasTrainer:
         )
 
         # Normal inverse wishart prior
-        self.prior = Wishart(
-            # Ignore words we're ignoring when computing the mean
-            self.vocab_embeddings[np.delete(np.arange(self.vocab_embeddings.shape[0]))],
-            kappa=kappa
-        )
+        self.prior = Wishart(self.vocab_embeddings, kappa=kappa)
 
         # Cache k_0\mu_0\mu_0^T, only compute it once
         # Used in calculate_table_params()
