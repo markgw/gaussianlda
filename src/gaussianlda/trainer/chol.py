@@ -30,7 +30,23 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 
 class GaussianLDATrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha, log=None, save_path=None,
-                 show_topics=None, cholesky_decomp=False):
+                 show_topics=None, cholesky_decomp=False, num_words_for_formatting=None):
+        """
+
+        :param corpus:
+        :param vocab_embeddings:
+        :param vocab:
+        :param num_tables:
+        :param alpha:
+        :param log:
+        :param save_path:
+        :param show_topics:
+        :param cholesky_decomp:
+        :param num_words_for_formatting: By default, each topic is formatted by computing the probability of
+            every word in the vocabulary under that topic. This can take a long time for a large vocabulary.
+            If given, this limits the number considered to the first
+            N in the vocabulary (which makes sense if the vocabulary is ordered with most common words first).
+        """
         if log is None:
             log = get_logger("GLDA")
         self.log = log
@@ -92,15 +108,17 @@ class GaussianLDATrainer:
         # Used in calculate_table_params()
         self.k0mu0mu0T = self.prior.kappa * np.outer(self.prior.mu, self.prior.mu)
 
+        self.num_words_for_formatting = num_words_for_formatting
+
         self.log.info("Initializing assignments")
         self.initialize()
 
     def initialize(self):
         """
         Initialize the gibbs sampler state.
-        
+
         I start with log N tables and randomly initialize customers to those tables.
-        
+
         """
         # First check the prior degrees of freedom.
         # It has to be >= num_dimension
@@ -517,10 +535,16 @@ class GaussianLDATrainer:
         if topics is None:
             topics = list(range(self.num_tables))
 
+        if self.num_words_for_formatting is not None:
+            # Limit to the first N words to consider for inclusion in a topic's representation
+            embeddings = self.vocab_embeddings[:self.num_words_for_formatting]
+        else:
+            embeddings = self.vocab_embeddings
+
         topic_fmt = []
         for topic in topics:
             # Compute the density for all words in the vocab
-            word_scores = self.log_multivariate_tdensity(self.vocab_embeddings, topic)
+            word_scores = self.log_multivariate_tdensity(embeddings, topic)
             word_probs = np.exp(word_scores - word_scores.max())
             word_probs /= word_probs.sum()
             topic_fmt.append(

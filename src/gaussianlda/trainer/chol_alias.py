@@ -39,7 +39,24 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha, kappa=0.1, log=None, save_path=None,
-                 show_topics=None, mh_steps=2):
+                 show_topics=None, mh_steps=2, num_words_for_formatting=None):
+        """
+
+        :param corpus:
+        :param vocab_embeddings:
+        :param vocab:
+        :param num_tables:
+        :param alpha:
+        :param kappa:
+        :param log:
+        :param save_path:
+        :param show_topics:
+        :param mh_steps:
+        :param num_words_for_formatting: By default, each topic is formatted by computing the probability of
+            every word in the vocabulary under that topic. This can take a long time for a large vocabulary.
+            If given, this limits the number considered to the first
+            N in the vocabulary (which makes sense if the vocabulary is ordered with most common words first).
+        """
         if log is None:
             log = get_logger("GLDA")
         self.log = log
@@ -98,6 +115,8 @@ class GaussianLDAAliasTrainer:
         # Used in calculate_table_params()
         self.k0mu0mu0T = self.prior.kappa * np.outer(self.prior.mu, self.prior.mu)
 
+        self.num_words_for_formatting = num_words_for_formatting
+
         self.log.info("Initializing assignments")
         self.initialize()
 
@@ -108,9 +127,9 @@ class GaussianLDAAliasTrainer:
     def initialize(self):
         """
         Initialize the gibbs sampler state.
-        
+
         I start with log N tables and randomly initialize customers to those tables.
-        
+
         """
         # First check the prior degrees of freedom.
         # It has to be >= num_dimension
@@ -340,10 +359,10 @@ class GaussianLDAAliasTrainer:
                         # that already have a non-zero count in the current document
                         non_zero_tables = np.where(self.table_counts_per_doc[:, d] > 0)[0]
                         if len(non_zero_tables) == 0:
+                            # If there's only one word in a doc, there are no topics to compute the full posterior for
                             no_non_zero = True
                         else:
-                            no_non_zero = True
-
+                            no_non_zero = False
                             # We only compute the posterior for these topics
                             posterior = np.zeros(len(non_zero_tables), dtype=np.float32)
                             for nz_table, table in enumerate(non_zero_tables):
@@ -375,23 +394,45 @@ class GaussianLDAAliasTrainer:
 
                                 if new_table_id != current_sample:
                                     # 2. Find acceptance probability
-                                    old_prob = _get_table_ll(current_sample)
-                                    new_prob = _get_table_ll(new_table_id)
+                                    old_log_prob = _get_table_ll(current_sample)
+                                    new_log_prob = _get_table_ll(new_table_id)
                                     # This can sometimes generate an overflow warning from Numpy
                                     # We don't care, though: in that case acceptance > 1., so we always accept
                                     with np.errstate(over="ignore"):
+                                        # From my reading of:
+                                        # Li et al. (2014): Reducing the sampling complexity of topic models
+                                        # the acceptance probability should be as follows:
                                         acceptance = \
                                             (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
                                             (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                            np.exp(new_prob - old_prob) * \
-                                            (self.table_counts_per_doc[current_sample, d]*old_prob +
+                                            np.exp(new_log_prob - old_log_prob) * \
+                                            (self.table_counts_per_doc[current_sample, d]*np.exp(old_log_prob) +
                                              self.alpha*alias.w.np[current_sample]) / \
-                                            (self.table_counts_per_doc[new_table_id, d]*new_prob +
+                                            (self.table_counts_per_doc[new_table_id, d]*np.exp(new_log_prob) +
                                              self.alpha*alias.w.np[new_table_id])
+                                        # The Java implementation, however, does this:
+                                        #acceptance = \
+                                        #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
+                                        #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                        #    np.exp(new_prob - old_prob) * \
+                                        #    (self.table_counts_per_doc[current_sample, d]*old_prob +
+                                        #     self.alpha*alias.w.np[current_sample]) / \
+                                        #    (self.table_counts_per_doc[new_table_id, d]*new_prob +
+                                        #     self.alpha*alias.w.np[new_table_id])
+                                        # The difference is the Java impl doesn't exp the log likelihood in the last
+                                        # fraction, i.e. it uses a log prob instead of a prob
                                     # 3. Compare against uniform[0,1]
-                                    if np.random.sample() < min(1., acceptance):
-                                        # This seems puzzling, but follows the Java impl exactly...
+                                    # If the acceptance prob > 1, we always accept: this means the new sample
+                                    # has a higher probability than the old
+                                    if acceptance >= 1. or np.random.sample() < acceptance:
+                                        # No need to sample if acceptance >= 1
+                                        # If the acceptance prob < 1, sample whether to accept or not, such that
+                                        # the more likely the new sample is compared to the old, the more likely we
+                                        # are to keep it
                                         current_sample = new_table_id
+                                    # NOTE: There seems to be a small error in the Java implementation here
+                                    # On the last MH step, it doesn't make any difference whether we accept the
+                                    # sample or not - we always end up using it
 
                         # Now have a new assignment: add its counts
                         self.table_assignments[d][w] = current_sample
@@ -408,6 +449,15 @@ class GaussianLDAAliasTrainer:
                 if self.show_topics is not None:
                     print("Topics after iteration {}".format(iteration))
                     print(self.format_topics())
+                    # Compute the overall usage of topics across the training corpus
+                    topic_props = self.table_counts_per_doc.sum(axis=1).astype(np.float64)
+                    topic_props /= topic_props.sum()
+                    print("Words using topics: {}".format(
+                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props))))
+                    topic_doc_props = (self.table_counts_per_doc > 0).astype(np.float64).sum(axis=1)
+                    topic_doc_props /= topic_doc_props.sum()
+                    print("Docs using topics: {}".format(
+                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props))))
 
                 if self.save_path is not None:
                     self.log.info("Saving model")
@@ -417,10 +467,16 @@ class GaussianLDAAliasTrainer:
         if topics is None:
             topics = list(range(self.num_tables))
 
+        if self.num_words_for_formatting is not None:
+            # Limit to the first N words to consider for inclusion in a topic's representation
+            embeddings = self.vocab_embeddings[:self.num_words_for_formatting]
+        else:
+            embeddings = self.vocab_embeddings
+
         topic_fmt = []
         for topic in topics:
             # Compute the density for all words in the vocab
-            word_scores = self.log_multivariate_tdensity(self.vocab_embeddings, topic)
+            word_scores = self.log_multivariate_tdensity(embeddings, topic)
             word_probs = np.exp(word_scores - word_scores.max())
             word_probs /= word_probs.sum()
             topic_fmt.append(
