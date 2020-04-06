@@ -1,6 +1,8 @@
 import logging
 import progressbar as pb
 
+import numpy as np
+
 from choldate import cholupdate, choldowndate
 
 
@@ -59,8 +61,22 @@ def get_progress_bar(maxval, title=None, counter=False):
 
 
 def chol_rank1_update(L, x):
+    # choldate only uses float64
     cholupdate(L.T, x.copy())
 
 
 def chol_rank1_downdate(L, x):
     choldowndate(L.T, x.copy())
+
+
+def sum_logprobs(logprobs):
+    """Sum probabilities represented as logprobs.
+
+    Avoids underflow by a standard trick. Not massively efficient: I think there's a
+    more efficient way to do this.
+
+    Returns the log of the summed probabilities.
+
+    """
+    max_prob = logprobs.max()
+    return np.log(np.sum(np.exp(logprobs - max_prob))) + max_prob

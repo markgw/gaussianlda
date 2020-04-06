@@ -27,18 +27,20 @@ import shutil
 from contextlib import ExitStack
 from multiprocessing import Process, sharedctypes
 from operator import mul
+import random
 
 import numpy as np
+from numpy.core.umath import isinf
 from numpy.linalg import slogdet
 from scipy.linalg import solve_triangular
 from scipy.special import gammaln
 
 from gaussianlda.prior import Wishart
-from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update
+from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update, sum_logprobs
 
 
 class GaussianLDAAliasTrainer:
-    def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha, kappa=0.1, log=None, save_path=None,
+    def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
                  show_topics=None, mh_steps=2, num_words_for_formatting=None):
         """
 
@@ -46,7 +48,7 @@ class GaussianLDAAliasTrainer:
         :param vocab_embeddings:
         :param vocab:
         :param num_tables:
-        :param alpha:
+        :param alpha: Dirichlet concentration. Defaults to 1/num_tables
         :param kappa:
         :param log:
         :param save_path:
@@ -69,6 +71,8 @@ class GaussianLDAAliasTrainer:
         self.mh_steps = mh_steps
 
         # Dirichlet hyperparam
+        if alpha is None:
+            alpha = 1. / num_tables
         self.alpha = alpha
 
         # dataVectors
@@ -309,13 +313,34 @@ class GaussianLDAAliasTrainer:
                     don't have to update the parameters
                 else update params of the old table.
         """
+        if self.show_topics is not None:
+            print("Topics after initialization")
+            print(self.format_topics())
+            # Compute the overall usage of topics across the training corpus
+            topic_props = self.table_counts_per_doc.sum(axis=1).astype(np.float64)
+            topic_props /= topic_props.sum()
+            print("Words using topics: {}".format(
+                ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props*100.))))
+            topic_doc_props = (self.table_counts_per_doc > 0).astype(np.float64).sum(axis=1)
+            topic_doc_props /= topic_doc_props.sum()
+            print("Docs using topics: {}".format(
+                ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props*100.))))
+
         with VoseAliasUpdater(
                 self.aliases, self.vocab_embeddings,
                 self.prior.kappa, self.prior.nu,
                 self.table_counts, self.table_means, self.table_cholesky_ltriangular_mat,
-                self.log_determinants
+                self.log_determinants,
         ) as alias_updater:
             for iteration in range(num_iterations):
+                # TODO Remove debugging diagnostics
+                select_pr_sum = 0.
+                select_pr_uses = 0
+                acceptance_sum = 0.
+                acceptance_uses = 0
+                accepted_total = 0
+                pr_accepted = 0
+                pr_used = 0
                 self.log.info("Iteration {}".format(iteration))
 
                 alias_updater.unpause()
@@ -348,13 +373,6 @@ class GaussianLDAAliasTrainer:
                         # Just update params for this customer
                         self.update_table_params(old_table_id, cust_id, is_removed=True)
 
-                        # Avoid recomputing the same probability multiple times
-                        _table_ll = {}
-                        def _get_table_ll(tab):
-                            if tab not in _table_ll:
-                                _table_ll[tab] = self.log_multivariate_tdensity(x, tab)
-                            return _table_ll[tab]
-
                         # Under the alias method, we only do the full likelihood computation for topics
                         # that already have a non-zero count in the current document
                         non_zero_tables = np.where(self.table_counts_per_doc[:, d] > 0)[0]
@@ -364,38 +382,58 @@ class GaussianLDAAliasTrainer:
                         else:
                             no_non_zero = False
                             # We only compute the posterior for these topics
-                            posterior = np.zeros(len(non_zero_tables), dtype=np.float32)
+                            log_priors = np.log(self.table_counts_per_doc[non_zero_tables, d])
+                            log_likelihoods = np.zeros(len(non_zero_tables), dtype=np.float32)
                             for nz_table, table in enumerate(non_zero_tables):
-                                log_likelihood = _get_table_ll(table)
-                                posterior[nz_table] = np.log(self.table_counts_per_doc[table, d]) + log_likelihood
+                                log_likelihoods[nz_table] = self.log_multivariate_tdensity(x, table)
+                            log_posterior = log_priors + log_likelihoods
 
                             # To prevent overflow, subtract by log(p_max)
-                            posterior -= posterior.max()
-                            posterior = np.exp(posterior)
-                            psum = posterior.sum()
-                            posterior /= psum
+                            # Java impl subtracts max before computing psum, but this seems to be wrong
+                            # We still subtract first, but then multiply by the max prob afterwards
+                            max_log_posterior = log_posterior.max()
+                            scaled_posterior = log_posterior - max_log_posterior
+                            # NB Not doing this now, but following what the Java impl does, however odd that seems
+                            #psum = np.exp(np.log(np.sum(np.exp(scaled_posterior))) + max_log_posterior)
+                            psum = np.sum(np.exp(scaled_posterior))
+                            # Now just use the scaled log posterior in the same way as in the Java impl
+                            # They have a bin-search method for sampling from the cumulative dist,
+                            # but we simply normalize and use Numpy to sample
+                            unnormed_posterior = np.exp(scaled_posterior)
+                            normed_posterior = unnormed_posterior / unnormed_posterior.sum()
 
                         # Don't let the alias parameters get updated in the middle of the sampling
                         alias = self.aliases[cust_id]
                         with alias.lock:
-                            select_pr = psum / (psum + self.alpha*alias.wsum)
+                            select_pr = psum / (psum + self.alpha*alias.likelihood_sum.np)
+                            select_pr_sum += select_pr
+                            select_pr_uses += 1
 
                             # MHV to draw new topic
                             # Take a number of Metropolis-Hastings samples
                             current_sample = old_table_id
+                            # Calculate the true likelihood of this word under the current sample,
+                            # for calculating acceptance prob
+                            current_sample_log_prob = self.log_multivariate_tdensity(x, current_sample)
                             for r in range(self.mh_steps):
                                 # 1. Flip a coin
+                                pr_used += 1
                                 if not no_non_zero and np.random.sample() < select_pr:
-                                    # Choose from the computed posterior dist
-                                    temp = np.random.choice(len(non_zero_tables), p=posterior)
-                                    new_table_id = non_zero_tables[temp]
+                                    # Choose from the exactly computed posterior dist, only allowing
+                                    # topics already sampled in the doc
+                                    temp = np.random.choice(len(non_zero_tables), p=normed_posterior)
+                                    new_sample = non_zero_tables[temp]
+                                    pr_accepted += 1
                                 else:
-                                    new_table_id = alias.sample_vose()
+                                    # Choose from the alias, allowing any topic but using slightly
+                                    # out-of-date likelihoods
+                                    # TODO Just using numpy for debugging
+                                    #new_sample = alias.sample_numpy()
+                                    new_sample = alias.sample_vose()
 
-                                if new_table_id != current_sample:
+                                if new_sample != current_sample:
                                     # 2. Find acceptance probability
-                                    old_log_prob = _get_table_ll(current_sample)
-                                    new_log_prob = _get_table_ll(new_table_id)
+                                    new_sample_log_prob = self.log_multivariate_tdensity(x, new_sample)
                                     # This can sometimes generate an overflow warning from Numpy
                                     # We don't care, though: in that case acceptance > 1., so we always accept
                                     with np.errstate(over="ignore"):
@@ -403,33 +441,46 @@ class GaussianLDAAliasTrainer:
                                         # Li et al. (2014): Reducing the sampling complexity of topic models
                                         # the acceptance probability should be as follows:
                                         acceptance = \
-                                            (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
+                                            (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
                                             (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                            np.exp(new_log_prob - old_log_prob) * \
-                                            (self.table_counts_per_doc[current_sample, d]*np.exp(old_log_prob) +
-                                             self.alpha*alias.w.np[current_sample]) / \
-                                            (self.table_counts_per_doc[new_table_id, d]*np.exp(new_log_prob) +
-                                             self.alpha*alias.w.np[new_table_id])
+                                            np.exp(new_sample_log_prob - current_sample_log_prob) * \
+                                            (self.table_counts_per_doc[current_sample, d]*np.exp(current_sample_log_prob) +
+                                             self.alpha*np.exp(alias.log_likelihoods.np[current_sample])) / \
+                                            (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
+                                             self.alpha*np.exp(alias.log_likelihoods.np[new_sample]))
+                                        acceptance_sum += acceptance
+                                        acceptance_uses += 1
+                                        # My earlier attempt:
+                                        #acceptance = \
+                                        #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
+                                        #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                        #    np.exp(new_log_prob - old_log_prob) * \
+                                        #    (self.table_counts_per_doc[current_sample, d]*np.exp(old_log_prob) +
+                                        #     self.alpha*alias.w.np[current_sample]) / \
+                                        #    (self.table_counts_per_doc[new_table_id, d]*np.exp(new_log_prob) +
+                                        #     self.alpha*alias.w.np[new_table_id])
                                         # The Java implementation, however, does this:
                                         #acceptance = \
                                         #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
                                         #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
                                         #    np.exp(new_prob - old_prob) * \
-                                        #    (self.table_counts_per_doc[current_sample, d]*old_prob +
+                                        #    (self.table_counts_per_doc[current_sample, d]*old_log_prob +
                                         #     self.alpha*alias.w.np[current_sample]) / \
-                                        #    (self.table_counts_per_doc[new_table_id, d]*new_prob +
+                                        #    (self.table_counts_per_doc[new_table_id, d]*new_log_prob +
                                         #     self.alpha*alias.w.np[new_table_id])
                                         # The difference is the Java impl doesn't exp the log likelihood in the last
                                         # fraction, i.e. it uses a log prob instead of a prob
                                     # 3. Compare against uniform[0,1]
                                     # If the acceptance prob > 1, we always accept: this means the new sample
                                     # has a higher probability than the old
-                                    if acceptance >= 1. or np.random.sample() < acceptance:
+                                    if isinf(acceptance) or acceptance >= 1. or np.random.sample() < acceptance:
                                         # No need to sample if acceptance >= 1
                                         # If the acceptance prob < 1, sample whether to accept or not, such that
                                         # the more likely the new sample is compared to the old, the more likely we
                                         # are to keep it
-                                        current_sample = new_table_id
+                                        current_sample = new_sample
+                                        current_sample_log_prob = new_sample_log_prob
+                                        accepted_total += 1
                                     # NOTE: There seems to be a small error in the Java implementation here
                                     # On the last MH step, it doesn't make any difference whether we accept the
                                     # sample or not - we always end up using it
@@ -443,8 +494,19 @@ class GaussianLDAAliasTrainer:
 
                         self.update_table_params(current_sample, cust_id)
 
+                        #if d>0 and d % 100 == 0:
+                        #    print("mean select_pr =", (select_pr_sum/select_pr_uses))
+
                 # Pause the alias updater until we start the next iteration
                 alias_updater.pause()
+
+                if acceptance_uses > 0:
+                    print("Mean acceptance: {:.2f}".format(acceptance_sum/acceptance_uses))
+                    print("Acceptance rate: {:.2f}%".format(float(accepted_total) / acceptance_uses * 100.))
+                else:
+                    print("No new samples drawn")
+                print("Mean select_pr:    {:.2f}".format(float(select_pr_sum)/select_pr_uses))
+                print("Prior select rate: {:.2f}%".format(float(pr_accepted) / pr_used * 100.))
 
                 if self.show_topics is not None:
                     print("Topics after iteration {}".format(iteration))
@@ -453,11 +515,11 @@ class GaussianLDAAliasTrainer:
                     topic_props = self.table_counts_per_doc.sum(axis=1).astype(np.float64)
                     topic_props /= topic_props.sum()
                     print("Words using topics: {}".format(
-                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props))))
+                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props*100.))))
                     topic_doc_props = (self.table_counts_per_doc > 0).astype(np.float64).sum(axis=1)
                     topic_doc_props /= topic_doc_props.sum()
                     print("Docs using topics: {}".format(
-                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props))))
+                        ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props*100.))))
 
                 if self.save_path is not None:
                     self.log.info("Saving model")
@@ -526,13 +588,17 @@ class VoseAlias:
     updates and sampling using the parameters don't get interleaved.
 
     """
-    def __init__(self, alias, prob, w, lock):
+    def __init__(self, alias, prob, log_likelihoods, likelihood_sum, lock):
         self.n = alias.shape
         # Alias indices
         self.alias = alias
         # Contains proportions and alias probabilities
         self.prob = prob
-        self.w = w
+        # Contains log likelihoods of the word given each topic
+        self.log_likelihoods = log_likelihoods
+        self.likelihood_sum = likelihood_sum
+
+        self.gen = random.Random()
 
         # Make sure we don't mix sampling and updating
         self.lock = lock
@@ -541,30 +607,40 @@ class VoseAlias:
     def create(num):
         alias = SharedArray.create(num, "int")
         prob = SharedArray.create(num, "float")
-        w = SharedArray.create(num, "float")
+        log_likelihoods = SharedArray.create(num, "float")
+        likelihood_sum = SharedArray.create(1, "float")
         lock = mp.Lock()
-        return VoseAlias(alias, prob, w, lock)
+        return VoseAlias(alias, prob, log_likelihoods, likelihood_sum, lock)
 
     def __getstate__(self):
-        return self.alias, self.prob, self.w, self.lock
+        return self.alias, self.prob, self.log_likelihoods, self.likelihood_sum, self.lock
 
     def __setstate__(self, state):
         self.__init__(*state)
 
-    @property
-    def wsum(self):
-        return self.prob.np.sum()
-
     def sample_vose(self):
-        # 1. Generate a fair die roll from an n-sided die; call the side i
-        fair_die = np.random.randint(self.n)
+        # 1. Generate a fair die roll from an n-sided die
+        fair_die = self.gen.randint(0, self.n-1)
         # 2. Flip a biased coin that comes up heads with probability Prob[i]
-        m = np.random.sample()
+        m = self.gen.random()
         # 3. If the coin comes up "heads," return i. Otherwise, return Alias[i]
         if m > self.prob.np[fair_die]:
             return self.alias.np[fair_die]
         else:
             return fair_die
+
+    def sample_numpy(self):
+        """
+        Draw sample without using the Vose alias, instead just using Numpy's sample method.
+        This should be less efficient, presumably, but is guaranteed to sample correctly,
+        so I'm using it as debugging.
+
+        """
+        lp = self.log_likelihoods.np
+        lp -= lp.max()
+        p = np.exp(lp)
+        p /= p.sum()
+        return np.random.choice(len(p), p=p)
 
 
 class VoseAliasUpdater(Process):
@@ -634,17 +710,23 @@ class VoseAliasUpdater(Process):
                 # This is because when we will be normalizing after exponentiating, each entry will be
                 # exp(log p_i - log p_max )/\Sigma_i exp(log p_i - log p_max)
                 # The log p_max cancels put and prevents overflow in the exponentiating phase
-                log_likelihoods -= log_likelihoods.max()
+                ll_max = log_likelihoods.max()
+                log_likelihoods_scaled = log_likelihoods - ll_max
                 # Exp them all to get the new w array
-                w = np.exp(log_likelihoods)
+                w = np.exp(log_likelihoods_scaled)
+                # Sum of likelihood has to be scaled back to its original sum, before we subtracted the max log
+                #likelihood_sum = np.exp(np.log(w.sum()) + ll_max)
+                # NB Not doing this now, but following what the Java impl does, however odd that seems
+                likelihood_sum = w.sum()
                 # Update the alias and probs using this w
                 new_alias, new_prob = self.generate_table(w)
                 # Update the parameters of this word's alias
                 term_alias = self.aliases[term_id]
                 with term_alias.lock:
-                    np.copyto(term_alias.w.np, w)
+                    np.copyto(term_alias.log_likelihoods.np, log_likelihoods)
                     np.copyto(term_alias.alias.np, new_alias)
                     np.copyto(term_alias.prob.np, new_prob)
+                    np.copyto(term_alias.likelihood_sum.np, likelihood_sum)
 
             # If this was the first iteration, we tell the main process that we've finished it
             self.initialized.set()
@@ -663,7 +745,61 @@ class VoseAliasUpdater(Process):
     def unpause(self):
         self.running.set()
 
+    def __generate_table(self, p):
+        """
+        Implementation of table generation based on wikipedia description of
+        algorithm, https://en.wikipedia.org/wiki/Alias_method
+
+        The input probability distribution, p, should contain values proportional
+        to the probabilities (i.e. not log probs), but does not need to be
+        normalized.
+
+        """
+        # probs: the probability table, U
+        # Initialize to np
+        probs = (p * self.num_tables) / p.sum()
+        # alias: the alias table, K
+        alias = np.zeros(self.num_tables, dtype=np.int32)
+
+        overfull = list(np.where(probs > 1.)[0])
+        underfull = list(np.where(probs < 1.)[0])
+        # This will generally be empty to start with
+        full = list(np.where(probs == 1.)[0])
+
+        # If there are any U=1 tables, set K=i, as recommended
+        if len(full):
+            alias[full] = full
+
+        # Loop until everything is in full, or we can't choose something from both
+        # Once something is neither in overfull nor underfull, it is exactly full
+        while len(overfull) and len(underfull):
+            # Choose an overfull entry i and underfull entry j
+            i = overfull.pop(0)
+            j = underfull.pop(0)
+            # Allocate unused space in j to outcome i
+            alias[j] = i
+            # Remove allocated space from entry i
+            # U_i = U_i - (1 - U_j)
+            probs[i] += probs[j] - 1.
+            # Entry j is now exactly full
+            # Assign entry i to the appropriate category based on the new value of probs[i]
+            if probs[i] < 1.:
+                underfull.append(i)
+            elif probs[i] > 1.:
+                overfull.append(i)
+            # Otherwise it is exactly full
+
+        # Due to FP errors, overfull and underfull might not empty at the same time
+        # Then we're supposed to set their prob values to 1
+        if len(overfull):
+            probs[overfull] = 1.
+        if len(underfull):
+            probs[underfull] = 1.
+
+        return alias, probs
+
     def generate_table(self, w):
+        ## The implementation copied from Java GaussianLDA
         # Generate a new prob array and alias table
         alias = np.zeros(self.num_tables, dtype=np.int32)
         # Contains proportions and alias probabilities
@@ -674,9 +810,15 @@ class VoseAliasUpdater(Process):
         p = (w * self.num_tables) / w.sum()
         # 3. For each scaled probability pi:
         #   a. If pi<1, add i to Small.
-        #   b. Otherwise(pi≥1), add i to Large.
-        small = list(np.where(p < 1.)[0])
-        large = list(np.where(p > 1.)[0])
+        #   b. Otherwise(pi>=1), add i to Large.
+        small, large = [], []
+        for i, pi in enumerate(p):
+            if pi < 1.:
+                small.append(i)
+            else:
+                large.append(i)
+        #small = list(np.where(p < 1.)[0])
+        #large = list(np.where(p >= 1.)[0])
         # 4. While Small and Large are not empty : (Large might be emptied first)
         #    a. Remove the first element from Small; call it l.
         #    b. Remove the first element from Large; call it g.
@@ -710,7 +852,7 @@ class VoseAliasUpdater(Process):
 
         return alias, prob
 
-    def log_multivariate_tdensity_tables(self, x):
+    def __log_multivariate_tdensity_tables(self, x):
         """
         A local version of the likelihood function from the main model, using the
         copy of the parameters we have in our local process.
@@ -748,6 +890,53 @@ class VoseAliasUpdater(Process):
                           (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
                   )
         return logprob
+
+    def log_multivariate_tdensity(self, x, table_id):
+        """
+        Gaussian likelihood for a table-embedding pair when using Cholesky decomposition.
+
+        """
+        # Make sure the main process doesn't update the parameters in the middle of the computation
+        with self.param_lock:
+            # Copy these values so we can release the lock and use a consistent state
+            count = self.table_counts[table_id].copy()
+            table_cholesky_ltriangular_mat = self.table_cholesky_ltriangular_mat[table_id].copy()
+            log_determinant = self.log_determinants[table_id].copy()
+            table_mean = self.table_means[table_id].copy()
+
+        k_n = self.kappa + count
+        nu_n = self.nu + count
+        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
+        nu = self.nu + count - self.embedding_size + 1.
+        # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
+        # therefore I am gonna use triangular solver
+        # first calculate (x-mu)
+        x_minus_mu = x - table_mean
+        # Now scale the lower tringular matrix
+        ltriangular_chol = scaleTdistrn * table_cholesky_ltriangular_mat
+        solved = solve_triangular(ltriangular_chol, x_minus_mu)
+        # Now take xTx (dot product)
+        val = (solved ** 2.).sum()
+
+        logprob = gammaln((nu + self.embedding_size) / 2.) - \
+                  (
+                          gammaln(nu / 2.) +
+                          self.embedding_size / 2. * (np.log(nu) + np.log(math.pi)) +
+                          log_determinant +
+                          (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
+                  )
+        return logprob
+
+    def log_multivariate_tdensity_tables(self, x):
+        """
+        Gaussian likelihood for a table-embedding pair when using Cholesky decomposition.
+        This version computes the likelihood for all tables in parallel.
+
+        """
+        lprobs = np.zeros(self.num_tables, dtype=np.float32)
+        for i in range(self.num_tables):
+            lprobs[i] = self.log_multivariate_tdensity(x, i)
+        return lprobs
 
 
 class GaussianLock(ExitStack):
@@ -789,11 +978,16 @@ class SharedArray:
            # Some numpy operations on arr.np: the numpy array backed by the shared memory
            arr.np[0] = 1
 
+    We are constrained to always using 64-bit floats, as choldate requires double types
+    to operate on.
+
     """
     def __init__(self, array, shape, lock, dtype):
         self.array = array
         self.shape = shape
-        self.np = np.frombuffer(self.array, dtype=dtype).reshape(self.shape)
+        np_array = np.frombuffer(self.array, dtype=dtype)
+        np_array = np_array.reshape(self.shape)
+        self.np = np_array
         # We use our own lock, not the mp.Array one, so that we can ensure all parameters are updated in a single op
         self.lock = lock
 
@@ -803,8 +997,8 @@ class SharedArray:
             ctype = "d"
             np_type = np.float64
         elif dtype == "int":
-            ctype = "l"
-            np_type = np.int64
+            ctype = "i"
+            np_type = np.int32
         else:
             raise ValueError("unknown type '{}'".format(dtype))
 

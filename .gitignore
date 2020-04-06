@@ -2,4 +2,5 @@ venv/
 .idea/
 dist/
 build/
-
+gaussianlda.egg-info
+__pycache__
