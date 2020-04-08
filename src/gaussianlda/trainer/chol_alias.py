@@ -41,7 +41,7 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
-                 show_topics=None, mh_steps=2, num_words_for_formatting=None, das_normalization=True):
+                 show_topics=None, mh_steps=2, num_words_for_formatting=None, das_normalization=True, show_progress=True):
         """
 
         :param corpus:
@@ -66,6 +66,7 @@ class GaussianLDAAliasTrainer:
         if log is None:
             log = get_logger("GLDA")
         self.log = log
+        self.show_progress = show_progress
         # Vocab is used for outputting topics
         self.vocab = vocab
         self.show_topics = show_topics
@@ -170,7 +171,7 @@ class GaussianLDAAliasTrainer:
 
         # Randomly assign customers to tables
         self.table_assignments = []
-        pbar = get_progress_bar(len(self.corpus), title="Initializing")
+        pbar = get_progress_bar(len(self.corpus), title="Initializing", show_progress=self.show_progress)
         for doc_num, doc in enumerate(pbar(self.corpus)):
             tables = list(np.random.randint(self.num_tables, size=len(doc)))
             self.table_assignments.append(tables)
@@ -328,7 +329,7 @@ class GaussianLDAAliasTrainer:
             print("Words using topics: {}".format(
                 ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props*100.))))
             topic_doc_props = (self.table_counts_per_doc > 0).astype(np.float64).sum(axis=1)
-            topic_doc_props /= topic_doc_props.sum()
+            topic_doc_props /= self.num_documents
             print("Docs using topics: {}".format(
                 ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props*100.))))
 
@@ -343,7 +344,7 @@ class GaussianLDAAliasTrainer:
                 self.log.info("Iteration {}".format(iteration))
 
                 alias_updater.unpause()
-                pbar = get_progress_bar(len(self.corpus), title="Sampling")
+                pbar = get_progress_bar(len(self.corpus), title="Sampling", show_progress=self.show_progress)
                 for d, doc in enumerate(pbar(self.corpus)):
                     if self.show_topics is not None and self.show_topics > 0 and d % self.show_topics == 0:
                         print("Topics after {:,} docs".format(d))
@@ -513,7 +514,7 @@ class GaussianLDAAliasTrainer:
                     print("Words using topics: {}".format(
                         ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_props*100.))))
                     topic_doc_props = (self.table_counts_per_doc > 0).astype(np.float64).sum(axis=1)
-                    topic_doc_props /= topic_doc_props.sum()
+                    topic_doc_props /= self.num_documents
                     print("Docs using topics: {}".format(
                         ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props*100.))))
 

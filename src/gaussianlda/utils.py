@@ -46,7 +46,11 @@ def get_logger(name):
     return log
 
 
-def get_progress_bar(maxval, title=None, counter=False):
+def get_progress_bar(maxval, title=None, counter=False, show_progress=True):
+    # Provides an easy way to switch to showing no progress bar
+    if not show_progress:
+        return lambda x: x
+
     widgets = []
     if title is not None:
         widgets.append("%s: " % title)
