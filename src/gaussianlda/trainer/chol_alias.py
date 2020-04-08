@@ -41,7 +41,7 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
-                 show_topics=None, mh_steps=2, num_words_for_formatting=None):
+                 show_topics=None, mh_steps=2, num_words_for_formatting=None, das_normalization=True):
         """
 
         :param corpus:
@@ -58,6 +58,10 @@ class GaussianLDAAliasTrainer:
             every word in the vocabulary under that topic. This can take a long time for a large vocabulary.
             If given, this limits the number considered to the first
             N in the vocabulary (which makes sense if the vocabulary is ordered with most common words first).
+        :param das_normalization: Use the normalization of probability distributions used by Das, Zaheer and Dyer's
+            original implementation when computing the sampling probability to choose whether to use the document
+            posterior or language model part of the topic posterior. If False, do not normalize in this way, but use
+            an alternative, which looks to me like it's more correct mathematically.
         """
         if log is None:
             log = get_logger("GLDA")
@@ -74,6 +78,8 @@ class GaussianLDAAliasTrainer:
         if alpha is None:
             alpha = 1. / num_tables
         self.alpha = alpha
+
+        self.das_normalization = das_normalization
 
         # dataVectors
         self.vocab_embeddings = vocab_embeddings
@@ -330,17 +336,10 @@ class GaussianLDAAliasTrainer:
                 self.aliases, self.vocab_embeddings,
                 self.prior.kappa, self.prior.nu,
                 self.table_counts, self.table_means, self.table_cholesky_ltriangular_mat,
-                self.log_determinants,
+                self.log_determinants, das_normalization=self.das_normalization,
         ) as alias_updater:
             for iteration in range(num_iterations):
-                # TODO Remove debugging diagnostics
-                select_pr_sum = 0.
-                select_pr_uses = 0
-                acceptance_sum = 0.
-                acceptance_uses = 0
-                accepted_total = 0
-                pr_accepted = 0
-                pr_used = 0
+                stats = SamplingDiagnostics()
                 self.log.info("Iteration {}".format(iteration))
 
                 alias_updater.unpause()
@@ -389,13 +388,15 @@ class GaussianLDAAliasTrainer:
                             log_posterior = log_priors + log_likelihoods
 
                             # To prevent overflow, subtract by log(p_max)
-                            # Java impl subtracts max before computing psum, but this seems to be wrong
-                            # We still subtract first, but then multiply by the max prob afterwards
                             max_log_posterior = log_posterior.max()
                             scaled_posterior = log_posterior - max_log_posterior
-                            # NB Not doing this now, but following what the Java impl does, however odd that seems
-                            #psum = np.exp(np.log(np.sum(np.exp(scaled_posterior))) + max_log_posterior)
-                            psum = np.sum(np.exp(scaled_posterior))
+                            if self.das_normalization:
+                                # Not doing this now, but following what the Java impl does, however odd that seems
+                                psum = np.sum(np.exp(scaled_posterior))
+                            else:
+                                # Java impl subtracts max before computing psum, but this seems to be wrong
+                                # We still subtract first, but then multiply by the max prob afterwards
+                                psum = np.exp(np.log(np.sum(np.exp(scaled_posterior))) + max_log_posterior)
                             # Now just use the scaled log posterior in the same way as in the Java impl
                             # They have a bin-search method for sampling from the cumulative dist,
                             # but we simply normalize and use Numpy to sample
@@ -406,8 +407,6 @@ class GaussianLDAAliasTrainer:
                         alias = self.aliases[cust_id]
                         with alias.lock:
                             select_pr = psum / (psum + self.alpha*alias.likelihood_sum.np)
-                            select_pr_sum += select_pr
-                            select_pr_uses += 1
 
                             # MHV to draw new topic
                             # Take a number of Metropolis-Hastings samples
@@ -417,19 +416,17 @@ class GaussianLDAAliasTrainer:
                             current_sample_log_prob = self.log_multivariate_tdensity(x, current_sample)
                             for r in range(self.mh_steps):
                                 # 1. Flip a coin
-                                pr_used += 1
                                 if not no_non_zero and np.random.sample() < select_pr:
                                     # Choose from the exactly computed posterior dist, only allowing
                                     # topics already sampled in the doc
                                     temp = np.random.choice(len(non_zero_tables), p=normed_posterior)
                                     new_sample = non_zero_tables[temp]
-                                    pr_accepted += 1
+                                    stats.log_select_pr(True, select_pr)
                                 else:
                                     # Choose from the alias, allowing any topic but using slightly
                                     # out-of-date likelihoods
-                                    # TODO Just using numpy for debugging
-                                    #new_sample = alias.sample_numpy()
                                     new_sample = alias.sample_vose()
+                                    stats.log_select_pr(False, select_pr)
 
                                 if new_sample != current_sample:
                                     # 2. Find acceptance probability
@@ -448,8 +445,6 @@ class GaussianLDAAliasTrainer:
                                              self.alpha*np.exp(alias.log_likelihoods.np[current_sample])) / \
                                             (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
                                              self.alpha*np.exp(alias.log_likelihoods.np[new_sample]))
-                                        acceptance_sum += acceptance
-                                        acceptance_uses += 1
                                         # My earlier attempt:
                                         #acceptance = \
                                         #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
@@ -480,7 +475,9 @@ class GaussianLDAAliasTrainer:
                                         # are to keep it
                                         current_sample = new_sample
                                         current_sample_log_prob = new_sample_log_prob
-                                        accepted_total += 1
+                                        stats.log_acceptance(True, acceptance)
+                                    else:
+                                        stats.log_acceptance(False, acceptance)
                                     # NOTE: There seems to be a small error in the Java implementation here
                                     # On the last MH step, it doesn't make any difference whether we accept the
                                     # sample or not - we always end up using it
@@ -494,19 +491,18 @@ class GaussianLDAAliasTrainer:
 
                         self.update_table_params(current_sample, cust_id)
 
-                        #if d>0 and d % 100 == 0:
-                        #    print("mean select_pr =", (select_pr_sum/select_pr_uses))
-
                 # Pause the alias updater until we start the next iteration
                 alias_updater.pause()
 
-                if acceptance_uses > 0:
-                    print("Mean acceptance: {:.2f}".format(acceptance_sum/acceptance_uses))
-                    print("Acceptance rate: {:.2f}%".format(float(accepted_total) / acceptance_uses * 100.))
+                # Output some useful stats about sampling
+                if stats.acceptance_used():
+                    self.log.info("Acceptance rate = {:.2f}%, mean acceptance: {:.2f}".format(
+                        stats.acceptance_rate()*100., stats.mean_acceptance()))
                 else:
-                    print("No new samples drawn")
-                print("Mean select_pr:    {:.2f}".format(float(select_pr_sum)/select_pr_uses))
-                print("Prior select rate: {:.2f}%".format(float(pr_accepted) / pr_used * 100.))
+                    self.log.info("No new samples drawn")
+                self.log.info("Prior select rate = {:.2f}%, mean select_pr = {:.2f}".format(
+                    stats.select_pr_rate() * 100., stats.mean_select_pr()
+                ))
 
                 if self.show_topics is not None:
                     print("Topics after iteration {}".format(iteration))
@@ -575,6 +571,48 @@ class GaussianLDAAliasTrainer:
         ]:
             with open(os.path.join(self.save_path, "{}.pkl".format(name)), "wb") as f:
                 pickle.dump(data, f)
+
+
+class SamplingDiagnostics:
+    """
+    Keeps track of a few statistics about the sampling process that can be useful to
+    display between iterations to give an idea of what's happening during sampling.
+
+    """
+    def __init__(self):
+        self._select_pr_sum = 0.
+        self._select_pr_uses = 0
+        self._pr_accepted = 0
+        self._acceptance_sum = 0.
+        self._acceptance_uses = 0
+        self._accepted_total = 0
+
+    def log_select_pr(self, selected, select_pr):
+        self._select_pr_sum += float(select_pr)
+        self._select_pr_uses += 1
+        if selected:
+            self._pr_accepted += 1
+
+    def log_acceptance(self, accepted, acceptance):
+        self._acceptance_sum += float(acceptance)
+        self._acceptance_uses += 1
+        if accepted:
+            self._accepted_total += 1
+
+    def acceptance_used(self):
+        return self._acceptance_uses > 0
+
+    def mean_acceptance(self):
+        return self._acceptance_sum / self._acceptance_uses
+
+    def acceptance_rate(self):
+        return float(self._accepted_total) / self._acceptance_uses
+
+    def mean_select_pr(self):
+        return self._select_pr_sum / self._select_pr_uses
+
+    def select_pr_rate(self):
+        return float(self._pr_accepted) / self._select_pr_uses
 
 
 class VoseAlias:
@@ -650,9 +688,10 @@ class VoseAliasUpdater(Process):
 
     """
     def __init__(self, aliases, embeddings, kappa, nu, table_counts, table_means, table_cholesky_ltriangular_mat,
-                 log_determinants):
+                 log_determinants, das_normalization=True):
         super().__init__()
         self.aliases = aliases
+        self.das_normalization = das_normalization
 
         # Gaussian parameters
         self.log_determinants = log_determinants.np
@@ -714,10 +753,12 @@ class VoseAliasUpdater(Process):
                 log_likelihoods_scaled = log_likelihoods - ll_max
                 # Exp them all to get the new w array
                 w = np.exp(log_likelihoods_scaled)
-                # Sum of likelihood has to be scaled back to its original sum, before we subtracted the max log
-                #likelihood_sum = np.exp(np.log(w.sum()) + ll_max)
-                # NB Not doing this now, but following what the Java impl does, however odd that seems
-                likelihood_sum = w.sum()
+                if self.das_normalization:
+                    # Not doing this now, but following what the Java impl does, however odd that seems
+                    likelihood_sum = w.sum()
+                else:
+                    # Sum of likelihood has to be scaled back to its original sum, before we subtracted the max log
+                    likelihood_sum = np.exp(np.log(w.sum()) + ll_max)
                 # Update the alias and probs using this w
                 new_alias, new_prob = self.generate_table(w)
                 # Update the parameters of this word's alias
