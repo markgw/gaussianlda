@@ -273,9 +273,6 @@ class GaussianLDATrainer:
             # The rank1 update equation is
             #  \Sigma_{n+1} = \Sigma_{n} + (k_0 + n + 1) / (k_0 + n) * (x_{n+1} - \mu_{n+1})(x_{n+1} - \mu_{n+1}) ^ T
             # calculate (X_{n} - \mu_{n-1})
-            if count == 0:
-                # What are we supposed to do here? Presumably this just never happens on larger datasets
-                raise ValueError("overall count for topic {} dropped to 0, so Cholesky update fails".format(table_id))
             # This time we update the mean first and use the new mean
             x = (self.vocab_embeddings[cust_id] - self.table_means[table_id]) * np.sqrt(k_n / (k_n - 1.))
             # The update modifies the decomp array in place
@@ -461,13 +458,6 @@ class GaussianLDATrainer:
 
                     # Remove custId from his old_table
                     old_table_id = self.table_assignments[d][w]
-                    # Check this isn't the last customer at the table
-                    if self.table_counts[old_table_id] == 1:
-                        # If we remove this customer from its table (to resample a topic for the word)
-                        # there will be no counts for the topic, so we can't compute likelihoods
-                        # There are various things we could do here, but we'll just skip resampling this
-                        # sample: it shouldn't happen often on a large dataset anyway
-                        continue
                     self.table_assignments[d][w] = -1  # Doesn't really make any difference, as only counts are used
                     self.table_counts[old_table_id] -= 1
                     self.table_counts_per_doc[old_table_id, d] -= 1
@@ -543,19 +533,23 @@ class GaussianLDATrainer:
 
         topic_fmt = []
         for topic in topics:
-            # Compute the density for all words in the vocab
-            word_scores = self.log_multivariate_tdensity(embeddings, topic)
-            word_probs = np.exp(word_scores - word_scores.max())
-            word_probs /= word_probs.sum()
-            topic_fmt.append(
-                "{}: {}".format(
-                    topic,
-                    " ".join(
-                        "{} ({:.2e})".format(self.vocab[word], word_probs[word])
-                        for word in np.argsort(-word_scores)[:num_words]
+            if self.table_counts[topic] == 0:
+                # This topic is never used, so should be considered to have been abandoned by the sampler (for now)
+                topic_fmt.append("{}: unused")
+            else:
+                # Compute the density for all words in the vocab
+                word_scores = self.log_multivariate_tdensity(embeddings, topic)
+                word_probs = np.exp(word_scores - word_scores.max())
+                word_probs /= word_probs.sum()
+                topic_fmt.append(
+                    "{}: {}".format(
+                        topic,
+                        " ".join(
+                            "{} ({:.2e})".format(self.vocab[word], word_probs[word])
+                            for word in np.argsort(-word_scores)[:num_words]
+                        )
                     )
                 )
-            )
 
         return "\n".join(topic_fmt)
 
