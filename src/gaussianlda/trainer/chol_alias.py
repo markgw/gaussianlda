@@ -17,26 +17,24 @@ a full implementation of the training routine given in the paper, with both
 speed-up tricks.
 
 """
-import functools
 import json
 import math
 import multiprocessing as mp
 import os
 import pickle
 import shutil
-from contextlib import ExitStack
-from multiprocessing import Process, sharedctypes
-from operator import mul
+from multiprocessing import Process
 import random
 
 import numpy as np
+from gaussianlda.mp_utils import GaussianLock, SharedArray, TwoSidedLock
 from numpy.core.umath import isinf
 from numpy.linalg import slogdet
 from scipy.linalg import solve_triangular
 from scipy.special import gammaln
 
 from gaussianlda.prior import Wishart
-from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update, sum_logprobs
+from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update
 
 
 class GaussianLDAAliasTrainer:
@@ -85,6 +83,7 @@ class GaussianLDAAliasTrainer:
         # dataVectors
         self.vocab_embeddings = vocab_embeddings
         self.embedding_size = vocab_embeddings.shape[1]
+        self.num_terms = vocab_embeddings.shape[0]
         # List of list of ints
         self.corpus = corpus
         # numIterations
@@ -128,12 +127,10 @@ class GaussianLDAAliasTrainer:
 
         self.num_words_for_formatting = num_words_for_formatting
 
+        self.aliases = VoseAliases.create(self.num_terms, self.num_tables)
+
         self.log.info("Initializing assignments")
         self.initialize()
-
-        self.aliases = [
-            VoseAlias.create(self.num_tables) for i in range(self.vocab_embeddings.shape[0])
-        ]
 
     def initialize(self):
         """
@@ -405,83 +402,74 @@ class GaussianLDAAliasTrainer:
                             normed_posterior = unnormed_posterior / unnormed_posterior.sum()
 
                         # Don't let the alias parameters get updated in the middle of the sampling
-                        alias = self.aliases[cust_id]
-                        with alias.lock:
-                            select_pr = psum / (psum + self.alpha*alias.likelihood_sum.np)
+                        self.aliases.lock.acquire_read(cust_id)
+                        select_pr = psum / (psum + self.alpha*self.aliases.likelihood_sum.np[cust_id])
 
-                            # MHV to draw new topic
-                            # Take a number of Metropolis-Hastings samples
-                            current_sample = old_table_id
-                            # Calculate the true likelihood of this word under the current sample,
-                            # for calculating acceptance prob
-                            current_sample_log_prob = self.log_multivariate_tdensity(x, current_sample)
-                            for r in range(self.mh_steps):
-                                # 1. Flip a coin
-                                if not no_non_zero and np.random.sample() < select_pr:
-                                    # Choose from the exactly computed posterior dist, only allowing
-                                    # topics already sampled in the doc
-                                    temp = np.random.choice(len(non_zero_tables), p=normed_posterior)
-                                    new_sample = non_zero_tables[temp]
-                                    stats.log_select_pr(True, select_pr)
+                        # MHV to draw new topic
+                        # Take a number of Metropolis-Hastings samples
+                        current_sample = old_table_id
+                        # Calculate the true likelihood of this word under the current sample,
+                        # for calculating acceptance prob
+                        current_sample_log_prob = self.log_multivariate_tdensity(x, current_sample)
+                        for r in range(self.mh_steps):
+                            # 1. Flip a coin
+                            if not no_non_zero and np.random.sample() < select_pr:
+                                # Choose from the exactly computed posterior dist, only allowing
+                                # topics already sampled in the doc
+                                temp = np.random.choice(len(non_zero_tables), p=normed_posterior)
+                                new_sample = non_zero_tables[temp]
+                                stats.log_select_pr(True, select_pr)
+                            else:
+                                # Choose from the alias, allowing any topic but using slightly
+                                # out-of-date likelihoods
+                                new_sample = self.aliases.sample_vose(cust_id)
+                                stats.log_select_pr(False, select_pr)
+
+                            if new_sample != current_sample:
+                                # 2. Find acceptance probability
+                                new_sample_log_prob = self.log_multivariate_tdensity(x, new_sample)
+                                # This can sometimes generate an overflow warning from Numpy
+                                # We don't care, though: in that case acceptance > 1., so we always accept
+                                with np.errstate(over="ignore"):
+                                    # From my reading of:
+                                    # Li et al. (2014): Reducing the sampling complexity of topic models
+                                    # the acceptance probability should be as follows:
+                                    acceptance = \
+                                        (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
+                                        (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                        np.exp(new_sample_log_prob - current_sample_log_prob) * \
+                                        (self.table_counts_per_doc[current_sample, d]*np.exp(current_sample_log_prob) +
+                                         self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, current_sample])) / \
+                                        (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
+                                         self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, new_sample]))
+                                    # The Java implementation, however, does this:
+                                    #acceptance = \
+                                    #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
+                                    #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                    #    np.exp(new_prob - old_prob) * \
+                                    #    (self.table_counts_per_doc[current_sample, d]*old_log_prob +
+                                    #     self.alpha*alias.w.np[current_sample]) / \
+                                    #    (self.table_counts_per_doc[new_table_id, d]*new_log_prob +
+                                    #     self.alpha*alias.w.np[new_table_id])
+                                    # The difference is the Java impl doesn't exp the log likelihood in the last
+                                    # fraction, i.e. it uses a log prob instead of a prob
+                                # 3. Compare against uniform[0,1]
+                                # If the acceptance prob > 1, we always accept: this means the new sample
+                                # has a higher probability than the old
+                                if isinf(acceptance) or acceptance >= 1. or np.random.sample() < acceptance:
+                                    # No need to sample if acceptance >= 1
+                                    # If the acceptance prob < 1, sample whether to accept or not, such that
+                                    # the more likely the new sample is compared to the old, the more likely we
+                                    # are to keep it
+                                    current_sample = new_sample
+                                    current_sample_log_prob = new_sample_log_prob
+                                    stats.log_acceptance(True, acceptance)
                                 else:
-                                    # Choose from the alias, allowing any topic but using slightly
-                                    # out-of-date likelihoods
-                                    new_sample = alias.sample_vose()
-                                    stats.log_select_pr(False, select_pr)
-
-                                if new_sample != current_sample:
-                                    # 2. Find acceptance probability
-                                    new_sample_log_prob = self.log_multivariate_tdensity(x, new_sample)
-                                    # This can sometimes generate an overflow warning from Numpy
-                                    # We don't care, though: in that case acceptance > 1., so we always accept
-                                    with np.errstate(over="ignore"):
-                                        # From my reading of:
-                                        # Li et al. (2014): Reducing the sampling complexity of topic models
-                                        # the acceptance probability should be as follows:
-                                        acceptance = \
-                                            (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
-                                            (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                            np.exp(new_sample_log_prob - current_sample_log_prob) * \
-                                            (self.table_counts_per_doc[current_sample, d]*np.exp(current_sample_log_prob) +
-                                             self.alpha*np.exp(alias.log_likelihoods.np[current_sample])) / \
-                                            (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
-                                             self.alpha*np.exp(alias.log_likelihoods.np[new_sample]))
-                                        # My earlier attempt:
-                                        #acceptance = \
-                                        #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
-                                        #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                        #    np.exp(new_log_prob - old_log_prob) * \
-                                        #    (self.table_counts_per_doc[current_sample, d]*np.exp(old_log_prob) +
-                                        #     self.alpha*alias.w.np[current_sample]) / \
-                                        #    (self.table_counts_per_doc[new_table_id, d]*np.exp(new_log_prob) +
-                                        #     self.alpha*alias.w.np[new_table_id])
-                                        # The Java implementation, however, does this:
-                                        #acceptance = \
-                                        #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
-                                        #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                        #    np.exp(new_prob - old_prob) * \
-                                        #    (self.table_counts_per_doc[current_sample, d]*old_log_prob +
-                                        #     self.alpha*alias.w.np[current_sample]) / \
-                                        #    (self.table_counts_per_doc[new_table_id, d]*new_log_prob +
-                                        #     self.alpha*alias.w.np[new_table_id])
-                                        # The difference is the Java impl doesn't exp the log likelihood in the last
-                                        # fraction, i.e. it uses a log prob instead of a prob
-                                    # 3. Compare against uniform[0,1]
-                                    # If the acceptance prob > 1, we always accept: this means the new sample
-                                    # has a higher probability than the old
-                                    if isinf(acceptance) or acceptance >= 1. or np.random.sample() < acceptance:
-                                        # No need to sample if acceptance >= 1
-                                        # If the acceptance prob < 1, sample whether to accept or not, such that
-                                        # the more likely the new sample is compared to the old, the more likely we
-                                        # are to keep it
-                                        current_sample = new_sample
-                                        current_sample_log_prob = new_sample_log_prob
-                                        stats.log_acceptance(True, acceptance)
-                                    else:
-                                        stats.log_acceptance(False, acceptance)
-                                    # NOTE: There seems to be a small error in the Java implementation here
-                                    # On the last MH step, it doesn't make any difference whether we accept the
-                                    # sample or not - we always end up using it
+                                    stats.log_acceptance(False, acceptance)
+                                # NOTE: There seems to be a small error in the Java implementation here
+                                # On the last MH step, it doesn't make any difference whether we accept the
+                                # sample or not - we always end up using it
+                        self.aliases.lock.release_read()
 
                         # Now have a new assignment: add its counts
                         self.table_assignments[d][w] = current_sample
@@ -574,61 +562,26 @@ class GaussianLDAAliasTrainer:
                 pickle.dump(data, f)
 
 
-class SamplingDiagnostics:
+class VoseAliases:
     """
-    Keeps track of a few statistics about the sampling process that can be useful to
-    display between iterations to give an idea of what's happening during sampling.
+    Implementation of Vose alias for faster sampling. This implementation
+    stores all the aliases for the entire vocabulary in a single data
+    structure, reducing memory overheads and making synchronization more
+    efficient.
 
-    """
-    def __init__(self):
-        self._select_pr_sum = 0.
-        self._select_pr_uses = 0
-        self._pr_accepted = 0
-        self._acceptance_sum = 0.
-        self._acceptance_uses = 0
-        self._accepted_total = 0
-
-    def log_select_pr(self, selected, select_pr):
-        self._select_pr_sum += float(select_pr)
-        self._select_pr_uses += 1
-        if selected:
-            self._pr_accepted += 1
-
-    def log_acceptance(self, accepted, acceptance):
-        self._acceptance_sum += float(acceptance)
-        self._acceptance_uses += 1
-        if accepted:
-            self._accepted_total += 1
-
-    def acceptance_used(self):
-        return self._acceptance_uses > 0
-
-    def mean_acceptance(self):
-        return self._acceptance_sum / self._acceptance_uses
-
-    def acceptance_rate(self):
-        return float(self._accepted_total) / self._acceptance_uses
-
-    def mean_select_pr(self):
-        return self._select_pr_sum / self._select_pr_uses
-
-    def select_pr_rate(self):
-        return float(self._pr_accepted) / self._select_pr_uses
-
-
-class VoseAlias:
-    """
-    Implementation of Vose alias for faster sampling.
+    The old implementation, where a separate table was maintained for every
+    word, each with a separate lock, is in `._old_alias.py` for reference.
 
     See https://github.com/rajarshd/Gaussian_LDA/blob/master/src/util/VoseAlias.java.
 
-    Each alias has its own lock. You should make sure you acquire the lock while either
-    using the alias for sampling or updating lock parameters, to ensure that parameter
-    updates and sampling using the parameters don't get interleaved.
+    We enforce locking with a single lock that ensures that reading and
+    writing of the same word's alias don't overlap. It's assumed that there's
+    exactly one process reading and one writing, as in the Gaussian LDA
+    sampler.
 
     """
     def __init__(self, alias, prob, log_likelihoods, likelihood_sum, lock):
-        self.n = alias.shape
+        self.n = alias.shape[1]
         # Alias indices
         self.alias = alias
         # Contains proportions and alias probabilities
@@ -639,17 +592,17 @@ class VoseAlias:
 
         self.gen = random.Random()
 
-        # Make sure we don't mix sampling and updating
         self.lock = lock
 
     @staticmethod
-    def create(num):
-        alias = SharedArray.create(num, "int")
-        prob = SharedArray.create(num, "float")
-        log_likelihoods = SharedArray.create(num, "float")
-        likelihood_sum = SharedArray.create(1, "float")
-        lock = mp.Lock()
-        return VoseAlias(alias, prob, log_likelihoods, likelihood_sum, lock)
+    def create(num_words, num_topics):
+        # Create big arrays to hold all the values for all words
+        alias = SharedArray.create((num_words, num_topics), "int")
+        prob = SharedArray.create((num_words, num_topics), "float")
+        log_likelihoods = SharedArray.create((num_words, num_topics), "float")
+        likelihood_sum = SharedArray.create(num_words, "float")
+        lock = TwoSidedLock.create()
+        return VoseAliases(alias, prob, log_likelihoods, likelihood_sum, lock)
 
     def __getstate__(self):
         return self.alias, self.prob, self.log_likelihoods, self.likelihood_sum, self.lock
@@ -657,25 +610,25 @@ class VoseAlias:
     def __setstate__(self, state):
         self.__init__(*state)
 
-    def sample_vose(self):
+    def sample_vose(self, word):
         # 1. Generate a fair die roll from an n-sided die
         fair_die = self.gen.randint(0, self.n-1)
         # 2. Flip a biased coin that comes up heads with probability Prob[i]
         m = self.gen.random()
         # 3. If the coin comes up "heads," return i. Otherwise, return Alias[i]
-        if m > self.prob.np[fair_die]:
-            return self.alias.np[fair_die]
+        if m > self.prob.np[word, fair_die]:
+            return self.alias.np[word, fair_die]
         else:
             return fair_die
 
-    def sample_numpy(self):
+    def sample_numpy(self, word):
         """
         Draw sample without using the Vose alias, instead just using Numpy's sample method.
         This should be less efficient, presumably, but is guaranteed to sample correctly,
         so I'm using it as debugging.
 
         """
-        lp = self.log_likelihoods.np
+        lp = self.log_likelihoods.np[word, :]
         lp -= lp.max()
         p = np.exp(lp)
         p /= p.sum()
@@ -763,12 +716,13 @@ class VoseAliasUpdater(Process):
                 # Update the alias and probs using this w
                 new_alias, new_prob = self.generate_table(w)
                 # Update the parameters of this word's alias
-                term_alias = self.aliases[term_id]
-                with term_alias.lock:
-                    np.copyto(term_alias.log_likelihoods.np, log_likelihoods)
-                    np.copyto(term_alias.alias.np, new_alias)
-                    np.copyto(term_alias.prob.np, new_prob)
-                    np.copyto(term_alias.likelihood_sum.np, likelihood_sum)
+                # Acquire the lock to write to this word
+                self.aliases.lock.acquire_write(term_id)
+                np.copyto(self.aliases.log_likelihoods.np[term_id], log_likelihoods)
+                np.copyto(self.aliases.alias.np[term_id], new_alias)
+                np.copyto(self.aliases.prob.np[term_id], new_prob)
+                self.aliases.likelihood_sum.np[term_id] = likelihood_sum  # This one is a single value
+                self.aliases.lock.release_write()
 
             # If this was the first iteration, we tell the main process that we've finished it
             self.initialized.set()
@@ -787,61 +741,8 @@ class VoseAliasUpdater(Process):
     def unpause(self):
         self.running.set()
 
-    def __generate_table(self, p):
-        """
-        Implementation of table generation based on wikipedia description of
-        algorithm, https://en.wikipedia.org/wiki/Alias_method
-
-        The input probability distribution, p, should contain values proportional
-        to the probabilities (i.e. not log probs), but does not need to be
-        normalized.
-
-        """
-        # probs: the probability table, U
-        # Initialize to np
-        probs = (p * self.num_tables) / p.sum()
-        # alias: the alias table, K
-        alias = np.zeros(self.num_tables, dtype=np.int32)
-
-        overfull = list(np.where(probs > 1.)[0])
-        underfull = list(np.where(probs < 1.)[0])
-        # This will generally be empty to start with
-        full = list(np.where(probs == 1.)[0])
-
-        # If there are any U=1 tables, set K=i, as recommended
-        if len(full):
-            alias[full] = full
-
-        # Loop until everything is in full, or we can't choose something from both
-        # Once something is neither in overfull nor underfull, it is exactly full
-        while len(overfull) and len(underfull):
-            # Choose an overfull entry i and underfull entry j
-            i = overfull.pop(0)
-            j = underfull.pop(0)
-            # Allocate unused space in j to outcome i
-            alias[j] = i
-            # Remove allocated space from entry i
-            # U_i = U_i - (1 - U_j)
-            probs[i] += probs[j] - 1.
-            # Entry j is now exactly full
-            # Assign entry i to the appropriate category based on the new value of probs[i]
-            if probs[i] < 1.:
-                underfull.append(i)
-            elif probs[i] > 1.:
-                overfull.append(i)
-            # Otherwise it is exactly full
-
-        # Due to FP errors, overfull and underfull might not empty at the same time
-        # Then we're supposed to set their prob values to 1
-        if len(overfull):
-            probs[overfull] = 1.
-        if len(underfull):
-            probs[underfull] = 1.
-
-        return alias, probs
-
     def generate_table(self, w):
-        ## The implementation copied from Java GaussianLDA
+        # This implementation is copied from Java GaussianLDA
         # Generate a new prob array and alias table
         alias = np.zeros(self.num_tables, dtype=np.int32)
         # Contains proportions and alias probabilities
@@ -981,85 +882,45 @@ class VoseAliasUpdater(Process):
         return lprobs
 
 
-class GaussianLock(ExitStack):
+class SamplingDiagnostics:
     """
-    Lock all the parameters of a gaussian, so we can either update them without them getting
-    used in a partially updated state or use them without risking some getting updated.
-
-    The arguments are SharedArrays. All of their locks will be acquired when entering
-    the context manager.
-
-    """
-    def __init__(self, table_counts, table_means, table_cholesky_ltriangular_mat, log_determinants):
-        super().__init__()
-        self.log_determinants_lock = log_determinants.lock
-        self.table_cholesky_ltriangular_mat_lock = table_cholesky_ltriangular_mat.lock
-        self.table_means_lock = table_means.lock
-        self.table_counts_lock = table_counts.lock
-
-    def __enter__(self):
-        obj = super().__enter__()
-        obj.enter_context(obj.log_determinants_lock)
-        obj.enter_context(obj.table_cholesky_ltriangular_mat_lock)
-        obj.enter_context(obj.table_means_lock)
-        obj.enter_context(obj.table_counts_lock)
-        return obj
-
-
-class SharedArray:
-    """
-    Small wrapper for a multiprocessing shared-memory array that will be used as the
-    in-memory storage for a numpy array. This allows a numpy array to be easily shared
-    between processes.
-
-    The array has a lock that should be acquired before reading or writing the numpy
-    array. The lock is not enforced automatically: you should always enclose any
-    numpy operations that access the shared-memory array in:
-
-       with arr.lock:
-           # Some numpy operations on arr.np: the numpy array backed by the shared memory
-           arr.np[0] = 1
-
-    We are constrained to always using 64-bit floats, as choldate requires double types
-    to operate on.
+    Keeps track of a few statistics about the sampling process that can be useful to
+    display between iterations to give an idea of what's happening during sampling.
+    This is mainly for debugging, but is quite a useful thing to output to give
+    an idea of what the sampler's doing in each iteration.
 
     """
-    def __init__(self, array, shape, lock, dtype):
-        self.array = array
-        self.shape = shape
-        np_array = np.frombuffer(self.array, dtype=dtype)
-        np_array = np_array.reshape(self.shape)
-        self.np = np_array
-        # We use our own lock, not the mp.Array one, so that we can ensure all parameters are updated in a single op
-        self.lock = lock
+    def __init__(self):
+        self._select_pr_sum = 0.
+        self._select_pr_uses = 0
+        self._pr_accepted = 0
+        self._acceptance_sum = 0.
+        self._acceptance_uses = 0
+        self._accepted_total = 0
 
-    @staticmethod
-    def create(shape, dtype="float"):
-        if dtype == "float":
-            ctype = "d"
-            np_type = np.float64
-        elif dtype == "int":
-            ctype = "i"
-            np_type = np.int32
-        else:
-            raise ValueError("unknown type '{}'".format(dtype))
+    def log_select_pr(self, selected, select_pr):
+        self._select_pr_sum += float(select_pr)
+        self._select_pr_uses += 1
+        if selected:
+            self._pr_accepted += 1
 
-        lock = mp.Lock()
-        # Allocate shared memory to sit behind the numpy array
-        if type(shape) is int:
-            size = shape
-        else:
-            size = functools.reduce(mul, shape)
-        array = sharedctypes.RawArray(ctype, size)
-        return SharedArray(array, shape, lock, np_type)
+    def log_acceptance(self, accepted, acceptance):
+        self._acceptance_sum += float(acceptance)
+        self._acceptance_uses += 1
+        if accepted:
+            self._accepted_total += 1
 
-    def __getstate__(self):
-        """
-        Arrays get pickled to be sent between processes. We ensure that the same
-        shared array is used on the other side.
+    def acceptance_used(self):
+        return self._acceptance_uses > 0
 
-        """
-        return self.array, self.shape, self.lock, self.np.dtype
+    def mean_acceptance(self):
+        return self._acceptance_sum / self._acceptance_uses
 
-    def __setstate__(self, state):
-        self.__init__(*state)
+    def acceptance_rate(self):
+        return float(self._accepted_total) / self._acceptance_uses
+
+    def mean_select_pr(self):
+        return self._select_pr_sum / self._select_pr_uses
+
+    def select_pr_rate(self):
+        return float(self._pr_accepted) / self._select_pr_uses
