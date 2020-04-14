@@ -461,6 +461,11 @@ class GaussianLDAAliasTrainer:
                                 # sample or not - we always end up using it
                         self.aliases.lock.release_read()
 
+                        if current_sample == old_table_id:
+                            stats.log_sampled_same()
+                        else:
+                            stats.log_sampled_different()
+
                         # Now have a new assignment: add its counts
                         self.table_assignments[d][w] = current_sample
                         with self.table_counts.lock:
@@ -475,13 +480,14 @@ class GaussianLDAAliasTrainer:
 
                 # Output some useful stats about sampling
                 if stats.acceptance_used():
-                    self.log.info("Acceptance rate = {:.2f}%, mean acceptance: {:.2f}".format(
-                        stats.acceptance_rate()*100., stats.mean_acceptance()))
+                    self.log.info("Acceptance rate = {:.2f}%, mean acceptance: {:.2f} ({:,} samples draw)".format(
+                        stats.acceptance_rate()*100., stats.mean_acceptance(), stats.acceptance_samples()))
                 else:
                     self.log.info("No new samples drawn")
                 self.log.info("Prior select rate = {:.2f}%, mean select_pr = {:.2f}".format(
                     stats.select_pr_rate() * 100., stats.mean_select_pr()
                 ))
+                self.log.info("Chose new sample: {:.2f}%".format(stats.sample_change_rate() * 100.))
 
                 if self.show_topics is not None:
                     print("Topics after iteration {}".format(iteration))
@@ -891,6 +897,8 @@ class SamplingDiagnostics:
         self._acceptance_sum = 0.
         self._acceptance_uses = 0
         self._accepted_total = 0
+        self._resampled_different = 0
+        self._resampled_total = 0
 
     def log_select_pr(self, selected, select_pr):
         self._select_pr_sum += float(select_pr)
@@ -904,6 +912,13 @@ class SamplingDiagnostics:
         if accepted:
             self._accepted_total += 1
 
+    def log_sampled_same(self):
+        self._resampled_total += 1
+
+    def log_sampled_different(self):
+        self._resampled_total += 1
+        self._resampled_different += 1
+
     def acceptance_used(self):
         return self._acceptance_uses > 0
 
@@ -913,8 +928,14 @@ class SamplingDiagnostics:
     def acceptance_rate(self):
         return float(self._accepted_total) / self._acceptance_uses
 
+    def acceptance_samples(self):
+        return self._acceptance_uses
+
     def mean_select_pr(self):
         return self._select_pr_sum / self._select_pr_uses
 
     def select_pr_rate(self):
         return float(self._pr_accepted) / self._select_pr_uses
+
+    def sample_change_rate(self):
+        return float(self._resampled_different) / self._resampled_total
