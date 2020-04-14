@@ -4,6 +4,7 @@ Multiprocessing architecture utilities, used by the alias implementation.
 """
 import functools
 import multiprocessing as mp
+from multiprocessing import sharedctypes
 from contextlib import ExitStack
 from operator import mul
 
