@@ -256,7 +256,7 @@ class GaussianLDAAliasTrainer:
         x_minus_mu = x - self.table_means.np[table_id]
         # Now scale the lower tringular matrix
         ltriangular_chol = scaleTdistrn * self.table_cholesky_ltriangular_mat.np[table_id]
-        solved = solve_triangular(ltriangular_chol, x_minus_mu)
+        solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum(-1)
 
@@ -288,7 +288,7 @@ class GaussianLDAAliasTrainer:
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table])
+            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
@@ -821,7 +821,7 @@ class VoseAliasUpdater(Process):
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table])
+            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
@@ -857,7 +857,7 @@ class VoseAliasUpdater(Process):
         x_minus_mu = x - table_mean
         # Now scale the lower tringular matrix
         ltriangular_chol = scaleTdistrn * table_cholesky_ltriangular_mat
-        solved = solve_triangular(ltriangular_chol, x_minus_mu)
+        solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum()
 
@@ -876,10 +876,36 @@ class VoseAliasUpdater(Process):
         This version computes the likelihood for all tables in parallel.
 
         """
-        lprobs = np.zeros(self.num_tables, dtype=np.float32)
-        for i in range(self.num_tables):
-            lprobs[i] = self.log_multivariate_tdensity(x, i)
-        return lprobs
+        # Make sure the main process doesn't update the parameters in the middle of the computation
+        with self.param_lock:
+            # Copy these values so we can release the lock and use a consistent state
+            counts = self.table_counts[:].copy()
+            table_cholesky_ltriangular_mats = self.table_cholesky_ltriangular_mat[:].copy()
+            log_determinants = self.log_determinants[:].copy()
+            table_means = self.table_means[:].copy()
+
+        k_n = self.kappa + counts  # Vector (K)
+        nu_n = self.nu + counts    # Vector (K)
+        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))   # Vector (K)
+        nu = self.nu + counts - self.embedding_size + 1.   # Vector (K)
+        x_minus_mu = x[None, :] - table_means  # Matrix (K, D)
+        # Now scale the lower tringular matrix
+        ltriangular_chol = scaleTdistrn[:, None, None] * table_cholesky_ltriangular_mats
+        # We can't do solve_triangular for all matrices at once in scipy
+        val = np.zeros(self.num_tables, dtype=np.float64)
+        for table in range(self.num_tables):
+            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
+            # Now take xTx (dot product)
+            val[table] = (table_solved ** 2.).sum()
+
+        logprob = gammaln((nu + self.embedding_size) / 2.) - \
+                  (
+                          gammaln(nu / 2.) +
+                          self.embedding_size / 2. * (np.log(nu) + np.log(math.pi)) +
+                          log_determinants +
+                          (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
+                  )
+        return logprob
 
 
 class SamplingDiagnostics:
