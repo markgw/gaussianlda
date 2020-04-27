@@ -11,7 +11,23 @@ from operator import mul
 import numpy as np
 
 
-class GaussianLock(ExitStack):
+class MultiLock(ExitStack):
+    """
+    Group multiple locks together to lock them all at once and release all at once.
+
+    """
+    def __init__(self, *locks):
+        super().__init__()
+        self.locks = locks
+
+    def __enter__(self):
+        obj = super().__enter__()
+        for lock in self.locks:
+            self.enter_context(lock)
+        return obj
+
+
+class GaussianLock(MultiLock):
     """
     Lock all the parameters of a gaussian, so we can either update them without them getting
     used in a partially updated state or use them without risking some getting updated.
@@ -20,20 +36,16 @@ class GaussianLock(ExitStack):
     the context manager.
 
     """
-    def __init__(self, table_counts, table_means, table_cholesky_ltriangular_mat, log_determinants):
-        super().__init__()
-        self.log_determinants_lock = log_determinants.lock
-        self.table_cholesky_ltriangular_mat_lock = table_cholesky_ltriangular_mat.lock
-        self.table_means_lock = table_means.lock
-        self.table_counts_lock = table_counts.lock
+    def __init__(self, table_counts, table_means, table_cholesky_ltriangular_mat,
+                 log_determinants, *args):
+        if len(args):
+            # Allow more arrays to be added
+            args = [a.lock for a in args]
 
-    def __enter__(self):
-        obj = super().__enter__()
-        obj.enter_context(obj.log_determinants_lock)
-        obj.enter_context(obj.table_cholesky_ltriangular_mat_lock)
-        obj.enter_context(obj.table_means_lock)
-        obj.enter_context(obj.table_counts_lock)
-        return obj
+        super().__init__(
+            log_determinants.lock, table_cholesky_ltriangular_mat.lock, table_means.lock, table_counts.lock,
+            *args
+        )
 
 
 class SharedArray:
