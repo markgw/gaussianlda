@@ -131,6 +131,41 @@ class GaussianLDA:
                 table_assignments[w] = new_table_id
         return table_assignments
 
+    def log_multivariate_tdensity(self, x, table_id):
+        """
+        Gaussian likelihood for a table-embedding pair when using Cholesky decomposition.
+
+        """
+        if x.ndim > 1:
+            logprobs = np.zeros(x.shape[0], dtype=np.float64)
+            for i in range(x.shape[0]):
+                logprobs[i] = self.log_multivariate_tdensity(x[i], table_id)
+            return logprobs
+
+        count = self.table_counts[table_id]
+        k_n = self.prior.kappa + count
+        nu_n = self.prior.nu + count
+        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
+        nu = self.prior.nu + count - self.embedding_size + 1.
+        # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
+        # therefore I am gonna use triangular solver
+        # first calculate (x-mu)
+        x_minus_mu = x - self.table_means[table_id]
+        # Now scale the lower tringular matrix
+        ltriangular_chol = scaleTdistrn * self.table_cholesky_ltriangular_mat[table_id]
+        solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
+        # Now take xTx (dot product)
+        val = (solved ** 2.).sum(-1)
+
+        logprob = gammaln((nu + self.embedding_size) / 2.) - \
+                  (
+                          gammaln(nu / 2.) +
+                          self.embedding_size / 2. * (np.log(nu) + np.log(math.pi)) +
+                          self.log_determinants[table_id] +
+                          (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
+                  )
+        return logprob
+
     def log_multivariate_tdensity_tables(self, x):
         """
         Gaussian likelihood for a table-embedding pair when using Cholesky decomposition.
