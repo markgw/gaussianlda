@@ -1,13 +1,15 @@
 import json
+import math
 import os
 import pickle
-import math
+import re
+import warnings
 
 import numpy as np
+from gaussianlda.prior import Wishart
 from scipy.linalg import solve_triangular
 from scipy.special import gammaln
-
-from gaussianlda.prior import Wishart
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class GaussianLDA:
@@ -20,7 +22,7 @@ class GaussianLDA:
 
     """
     def __init__(self, vocab_embeddings, vocab, num_tables, alpha, kappa, table_counts, table_means, log_determinants,
-                 sum_squared_table_customers, table_cholesky_ltriangular_mat):
+                 table_cholesky_ltriangular_mat):
         # Vocab is used for outputting topics
         self.vocab = vocab
 
@@ -41,8 +43,6 @@ class GaussianLDA:
         # log-determinant of covariance matrix for each table.
         # Since 0.5 * logDet is required in (see logMultivariateTDensity), that value is kept.
         self.log_determinants = log_determinants
-        # Stores the squared sum of the vectors of customers at a given table
-        self.sum_squared_table_customers = sum_squared_table_customers
         # Cholesky Lower Triangular Decomposition of covariance matrix associated with each table.
         self.table_cholesky_ltriangular_mat = table_cholesky_ltriangular_mat
 
@@ -63,6 +63,119 @@ class GaussianLDA:
         self.nu = self.prior.nu + self.table_counts - self.embedding_size + 1.
 
     @staticmethod
+    def load_from_java(path, vocab_embeddings_path, vocab_path, alpha=None, kappa=None, iteration=-1,
+                       output_checks=False):
+        """
+        NB: This isn't fully working yet!
+
+        Load a Gaussian LDA model trained and saved by the Gaussian LDA authors' original
+        Java code, available at https://github.com/rajarshd/Gaussian_LDA/.
+        The path given is to the directory containing all of the model files.
+
+        Embeddings and vocab are not stored with the model, so need to be provided.
+        They are given as paths to the files, stored in the same format expected by Gaussian
+        LDA. This means you can use exactly the files you used to train the model.
+
+        The files contain the output from each iteration of training. We just get the last iteration,
+        or another one if explicitly requested.
+
+        Unfortunately, the output does not store the hyperparameters alpha and kappa.
+        kappa is needed to compute likelihoods under the topics and alpha is needed to perform
+        topic inference, so you need to make sure these are correct to do correct inference.
+        If not given, the default values from training are used.
+
+        """
+        # Load the vocab
+        with open(vocab_path, "r") as f:
+            vocab = [w.rstrip("\n") for w in f.readlines()]
+        # Load the embeddings
+        with open(vocab_embeddings_path, "r") as f:
+            # Read the first line to check the dimensionality
+            embedding_size = len(f.readline().split())
+            # Put the embeddings into a Numpy array
+            vocab_embeddings = np.zeros((len(vocab), embedding_size), dtype=np.float64)
+            # We don't go back and read the first line, as it's never used by the model
+            for i, line in enumerate(f):
+                line = line.rstrip("\n")
+                vocab_embeddings[i, :] = [float(v) for v in line.split()]
+
+        if output_checks:
+            # Sanity check the embeddings and vocab
+            for w, top_word in enumerate(vocab[:3]):
+                nns = np.argsort(-cosine_similarity(vocab_embeddings[w].reshape(1,-1), vocab_embeddings)[0])
+                print("NNs to {}: {}".format(top_word, ", ".join(vocab[nb] for nb in nns[:5])))
+
+        filenames = os.listdir(path)
+        table_params_re = re.compile("\d+\.txt")
+        table_params_filenames = [f for f in filenames if re.match(table_params_re, f)]
+
+        num_tables = len(table_params_filenames)
+        num_iterations = None
+
+        # Create empty arrays to fill
+        table_cholesky_ltriangular_mat = np.zeros((num_tables, embedding_size, embedding_size), dtype=np.float64)
+        table_means = np.zeros((num_tables, embedding_size), dtype=np.float64)
+        for table_filename in table_params_filenames:
+            # Filename is of the form k.txt
+            table_num = int(table_filename[:-4])
+            with open(os.path.join(path, table_filename), "r") as f:
+                lines = f.readlines()
+            # Each iteration stores D+1 lines: 1 line of the mean and D lines of the matrix
+            file_num_iterations = len(lines) // (embedding_size+1)
+            if len(lines) % (embedding_size+1) != 0:
+                warnings.warn("Gaussian LDA model does not have an exact number of iterations stored "
+                              "({} iterations, plus {} lines)".format(file_num_iterations,
+                                                                      len(lines) % (embedding_size+1)))
+            if num_iterations is not None and file_num_iterations != num_iterations:
+                warnings.warn("Different numbers of iterations stored for different tables: {} != {}"
+                              .format(file_num_iterations, num_iterations))
+            num_iterations = file_num_iterations
+            if iteration == -1:
+                iteration_start_line = (num_iterations-1)*(embedding_size+1)
+            else:
+                iteration_start_line = iteration * (embedding_size+1)
+            # The last D lines are the matrix and the one before is the mean
+            # The first line contains the table mean
+            table_mean = [float(v) for v in lines[iteration_start_line].split()]
+            if len(table_mean) != embedding_size:
+                raise ValueError("expected {}-size mean, but got {} for table {}".format(
+                    embedding_size, len(table_mean), table_num))
+            table_means[table_num, :] = table_mean
+            # The remaining lines are the chol decomp of the cov matrix
+            chol_mat = np.array([
+                [float(v) for v in line.split()]
+                for line in lines[iteration_start_line+1:iteration_start_line+embedding_size+1]
+            ], dtype=np.float64)
+            table_cholesky_ltriangular_mat[table_num, :, :] = chol_mat
+
+        # Compute the log determinants from the chol decomposition of the covariance matrices
+        log_determinants = np.zeros(num_tables, dtype=np.float64)
+        for table in range(num_tables):
+            # Log det of cov matrix is 2*log det of chol decomp
+            log_determinants[table] = 2. * np.linalg.slogdet(table_cholesky_ltriangular_mat[table])[1]
+
+        with open(os.path.join(path, "topic_counts.txt"), "r") as f:
+            lines = f.readlines()
+        if iteration == -1:
+            # The last K lines give us the final counts
+            table_counts = np.array([float(v) for v in lines[-num_tables:]], dtype=np.float64)
+        else:
+            table_counts = np.array(
+                [float(v) for v in lines[iteration*num_tables:(iteration+1)*num_tables]], dtype=np.float64)
+
+        if alpha is None:
+            alpha = 1. / num_tables
+        if kappa is None:
+            kappa = 0.1
+
+        # Initialize a model
+        model = GaussianLDA(
+            vocab_embeddings, vocab, num_tables, alpha, kappa,
+            table_counts, table_means, log_determinants, table_cholesky_ltriangular_mat,
+        )
+        return model
+
+    @staticmethod
     def load(path):
         # Load JSON hyperparams
         with open(os.path.join(path, "params.json"), "r") as f:
@@ -71,8 +184,7 @@ class GaussianLDA:
         # Load numpy arrays for model parameters
         arrs = {}
         for name in [
-            "table_counts", "table_means", "log_determinants", "sum_squared_table_customers",
-            "table_cholesky_ltriangular_mat", "vocab_embeddings",
+            "table_counts", "table_means", "log_determinants", "table_cholesky_ltriangular_mat", "vocab_embeddings",
         ]:
             with open(os.path.join(path, "{}.pkl".format(name)), "rb") as f:
                 arrs[name] = pickle.load(f)
@@ -81,7 +193,7 @@ class GaussianLDA:
         model = GaussianLDA(
             arrs["vocab_embeddings"], hyperparams["vocab"], hyperparams["num_tables"], hyperparams["alpha"],
             hyperparams["kappa"],
-            arrs["table_counts"], arrs["table_means"], arrs["log_determinants"], arrs["sum_squared_table_customers"],
+            arrs["table_counts"], arrs["table_means"], arrs["log_determinants"],
             arrs["table_cholesky_ltriangular_mat"],
         )
         return model
