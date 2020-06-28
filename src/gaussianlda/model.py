@@ -61,12 +61,17 @@ class GaussianLDA:
         nu_n = self.prior.nu + self.table_counts
         self.scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
         self.nu = self.prior.nu + self.table_counts - self.embedding_size + 1.
+        # We can even scale the cholesky decomposition by scaleTdistrn
+        self.scabled_table_cholesky_ltriangular_mat = \
+            self.scaleTdistrn[:, np.newaxis, np.newaxis] * self.table_cholesky_ltriangular_mat
+
+        self._topic_word_pdf_cache = {}
 
     @staticmethod
-    def load_from_java(path, vocab_embeddings_path, vocab_path, alpha=None, kappa=None, iteration=-1,
-                       output_checks=False):
+    def load_from_java(path, vocab_embeddings_path, vocab_path, alpha=None, kappa=None, nu=None, output_checks=False):
         """
         NB: This isn't fully working yet!
+        I can't work out why not.
 
         Load a Gaussian LDA model trained and saved by the Gaussian LDA authors' original
         Java code, available at https://github.com/rajarshd/Gaussian_LDA/.
@@ -110,7 +115,13 @@ class GaussianLDA:
         table_params_filenames = [f for f in filenames if re.match(table_params_re, f)]
 
         num_tables = len(table_params_filenames)
-        num_iterations = None
+
+        if alpha is None:
+            alpha = 1. / num_tables
+        if kappa is None:
+            kappa = 0.1
+        if nu is None:
+            nu = embedding_size
 
         # Create empty arrays to fill
         table_cholesky_ltriangular_mat = np.zeros((num_tables, embedding_size, embedding_size), dtype=np.float64)
@@ -120,53 +131,42 @@ class GaussianLDA:
             table_num = int(table_filename[:-4])
             with open(os.path.join(path, table_filename), "r") as f:
                 lines = f.readlines()
-            # Each iteration stores D+1 lines: 1 line of the mean and D lines of the matrix
-            file_num_iterations = len(lines) // (embedding_size+1)
             if len(lines) % (embedding_size+1) != 0:
-                warnings.warn("Gaussian LDA model does not have an exact number of iterations stored "
-                              "({} iterations, plus {} lines)".format(file_num_iterations,
-                                                                      len(lines) % (embedding_size+1)))
-            if num_iterations is not None and file_num_iterations != num_iterations:
-                warnings.warn("Different numbers of iterations stored for different tables: {} != {}"
-                              .format(file_num_iterations, num_iterations))
-            num_iterations = file_num_iterations
-            if iteration == -1:
-                iteration_start_line = (num_iterations-1)*(embedding_size+1)
-            else:
-                iteration_start_line = iteration * (embedding_size+1)
+                warnings.warn("Gaussian LDA model does not have the right number of lines "
+                              "({} lines, expected {}+1)".format(len(lines), embedding_size))
             # The last D lines are the matrix and the one before is the mean
             # The first line contains the table mean
-            table_mean = [float(v) for v in lines[iteration_start_line].split()]
+            table_mean = [float(v) for v in lines[0].rstrip("\n").split()]
             if len(table_mean) != embedding_size:
                 raise ValueError("expected {}-size mean, but got {} for table {}".format(
                     embedding_size, len(table_mean), table_num))
             table_means[table_num, :] = table_mean
             # The remaining lines are the chol decomp of the cov matrix
             chol_mat = np.array([
-                [float(v) for v in line.split()]
-                for line in lines[iteration_start_line+1:iteration_start_line+embedding_size+1]
+                [float(v) for v in line.rstrip("\n").split()]
+                for line in lines[1:]
             ], dtype=np.float64)
             table_cholesky_ltriangular_mat[table_num, :, :] = chol_mat
 
-        # Compute the log determinants from the chol decomposition of the covariance matrices
-        log_determinants = np.zeros(num_tables, dtype=np.float64)
-        for table in range(num_tables):
-            # Log det of cov matrix is 2*log det of chol decomp
-            log_determinants[table] = 2. * np.linalg.slogdet(table_cholesky_ltriangular_mat[table])[1]
-
+        # Load the total counts of customers at each table
         with open(os.path.join(path, "topic_counts.txt"), "r") as f:
             lines = f.readlines()
-        if iteration == -1:
-            # The last K lines give us the final counts
-            table_counts = np.array([float(v) for v in lines[-num_tables:]], dtype=np.float64)
-        else:
-            table_counts = np.array(
-                [float(v) for v in lines[iteration*num_tables:(iteration+1)*num_tables]], dtype=np.float64)
+        # Should be K lines, with a count for each table
+        if len(lines) != num_tables:
+            raise IOError("expected {} lines in topic_counts.txt, got {}".format(num_tables, len(lines)))
+        # The last K lines give us the final counts
+        table_counts = np.array([float(v.rstrip("\n")) for v in lines], dtype=np.float64)
 
-        if alpha is None:
-            alpha = 1. / num_tables
-        if kappa is None:
-            kappa = 0.1
+        # Compute the log determinants from the chol decomposition of the covariance matrices
+        log_determinants = np.zeros(num_tables, dtype=np.float64)
+        # Compute this in the same way as the Java code does
+        for table in range(num_tables):
+            # Log det of cov matrix is 2*log det of chol decomp
+            k_n = table_counts[table] + kappa
+            nu_n = table_counts[table] + nu
+            scale_t_distrn = (k_n + 1.) / (k_n * (nu_n - embedding_size + 1))
+            log_determinants[table] = np.sum(np.log(np.diag(table_cholesky_ltriangular_mat[table, :, :]))) \
+                                      + embedding_size * np.log(scale_t_distrn) / 2.
 
         # Initialize a model
         model = GaussianLDA(
@@ -202,6 +202,8 @@ class GaussianLDA:
         """
         Run Gibbs sampler on a single document without updating global parameters.
 
+        Input document should be a list of word strings.
+
         for num_iters:
             for each customer
                 remove him from his old_table and update the table params.
@@ -210,11 +212,12 @@ class GaussianLDA:
                 Calculate prior and likelihood for this customer sitting at each table
                 sample for a table index
         """
+        doc_ids = [self.vocab.index(w) for w in doc if w in self.vocab]
         table_assignments = list(np.random.randint(self.num_tables, size=len(doc)))
         doc_table_counts = np.bincount(table_assignments, minlength=self.num_tables)
 
         for iteration in range(num_iterations):
-            for w, cust_id in enumerate(doc):
+            for w, cust_id in enumerate(doc_ids):
                 x = self.vocab_embeddings[cust_id]
 
                 # Remove custId from his old_table
@@ -226,7 +229,7 @@ class GaussianLDA:
                 # Go over each table
                 counts = doc_table_counts[:] + self.alpha
                 # Now calculate the likelihood for each table
-                log_lls = self.log_multivariate_tdensity_tables(x)
+                log_lls = self.log_multivariate_tdensity_tables(cust_id)
                 # Add log prior in the posterior vector
                 log_posteriors = np.log(counts) + log_lls
                 # To prevent overflow, subtract by log(p_max).
@@ -254,17 +257,10 @@ class GaussianLDA:
                 logprobs[i] = self.log_multivariate_tdensity(x[i], table_id)
             return logprobs
 
-        count = self.table_counts[table_id]
-        k_n = self.prior.kappa + count
-        nu_n = self.prior.nu + count
-        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
-        nu = self.prior.nu + count - self.embedding_size + 1.
-        # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
-        # therefore I am gonna use triangular solver
+        nu = self.nu[table_id]
         # first calculate (x-mu)
         x_minus_mu = x - self.table_means[table_id]
-        # Now scale the lower tringular matrix
-        ltriangular_chol = scaleTdistrn * self.table_cholesky_ltriangular_mat[table_id]
+        ltriangular_chol = self.scabled_table_cholesky_ltriangular_mat[table_id]
         solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum(-1)
@@ -283,16 +279,26 @@ class GaussianLDA:
         Gaussian likelihood for a table-embedding pair when using Cholesky decomposition.
         This version computes the likelihood for all tables in parallel.
 
+        If x is an int, it is treated as an index to the vocabulary of known embeddings. This
+        will often be a more efficient way to call this repeated times, since it allows us to
+        caches the concept-word probs for words in the vocabulary. This is possible, since
+        the concept parameters are never updated.
+
         """
+        if type(x) is int:
+            # Treat as vocab index and cache the probability
+            if x not in self._topic_word_pdf_cache:
+                # Not already computed this: compute now and cache the logprobs
+                self._topic_word_pdf_cache[x] = self.log_multivariate_tdensity_tables(self.vocab_embeddings[x])
+            return self._topic_word_pdf_cache[x]
+
         # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
         # therefore I am gonna use triangular solver first calculate (x-mu)
         x_minus_mu = x[None, :] - self.table_means
-        # Now scale the lower tringular matrix
-        ltriangular_chol = self.scaleTdistrn[:, None, None] * self.table_cholesky_ltriangular_mat
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table])
+            table_solved = solve_triangular(self.scabled_table_cholesky_ltriangular_mat[table], x_minus_mu[table])
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
