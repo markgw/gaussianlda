@@ -39,7 +39,9 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
-                 show_topics=None, mh_steps=2, num_words_for_formatting=None, das_normalization=True, show_progress=True):
+                 show_topics=None, mh_steps=2, num_words_for_formatting=None,
+                 das_normalization=True, das_acceptance=False,
+                 show_progress=True):
         """
 
         :param corpus:
@@ -60,6 +62,10 @@ class GaussianLDAAliasTrainer:
             original implementation when computing the sampling probability to choose whether to use the document
             posterior or language model part of the topic posterior. If False, do not normalize in this way, but use
             an alternative, which looks to me like it's more correct mathematically.
+        :param das_acceptance: Use the acceptance probability calculation exactly as in Das et al.'s Java
+            implementation. Default behaviour is to use a corrected version of the calculation based on my
+            reading of the background literature. For exact comparison to the Java implementation,
+            the original formula should be used.
         """
         if log is None:
             log = get_logger("GLDA")
@@ -79,6 +85,7 @@ class GaussianLDAAliasTrainer:
         self.alpha = alpha
 
         self.das_normalization = das_normalization
+        self.das_acceptance = das_acceptance
 
         # dataVectors
         self.vocab_embeddings = vocab_embeddings
@@ -421,28 +428,30 @@ class GaussianLDAAliasTrainer:
                                 # This can sometimes generate an overflow warning from Numpy
                                 # We don't care, though: in that case acceptance > 1., so we always accept
                                 with np.errstate(over="ignore"):
-                                    # From my reading of:
-                                    # Li et al. (2014): Reducing the sampling complexity of topic models
-                                    # the acceptance probability should be as follows:
-                                    acceptance = \
-                                        (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
-                                        (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                        np.exp(new_sample_log_prob - current_sample_log_prob) * \
-                                        (self.table_counts_per_doc[current_sample, d]*np.exp(current_sample_log_prob) +
-                                         self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, current_sample])) / \
-                                        (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
-                                         self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, new_sample]))
-                                    # The Java implementation, however, does this:
-                                    #acceptance = \
-                                    #    (self.table_counts_per_doc[new_table_id, d] + self.alpha) / \
-                                    #    (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
-                                    #    np.exp(new_prob - old_prob) * \
-                                    #    (self.table_counts_per_doc[current_sample, d]*old_log_prob +
-                                    #     self.alpha*alias.w.np[current_sample]) / \
-                                    #    (self.table_counts_per_doc[new_table_id, d]*new_log_prob +
-                                    #     self.alpha*alias.w.np[new_table_id])
-                                    # The difference is the Java impl doesn't exp the log likelihood in the last
-                                    # fraction, i.e. it uses a log prob instead of a prob
+                                    if not self.das_acceptance:
+                                        # From my reading of:
+                                        # Li et al. (2014): Reducing the sampling complexity of topic models
+                                        # the acceptance probability should be as follows:
+                                        acceptance = \
+                                            (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
+                                            (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                            np.exp(new_sample_log_prob - current_sample_log_prob) * \
+                                            (self.table_counts_per_doc[current_sample, d]*np.exp(current_sample_log_prob) +
+                                             self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, current_sample])) / \
+                                            (self.table_counts_per_doc[new_sample, d]*np.exp(new_sample_log_prob) +
+                                             self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, new_sample]))
+                                        # The difference is the Java impl doesn't exp the log likelihood in the last
+                                        # fraction, i.e. it uses a log prob instead of a prob
+                                    else:
+                                        # The Java implementation, however, does this:
+                                        acceptance = \
+                                            (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
+                                            (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
+                                            np.exp(new_sample_log_prob - current_sample_log_prob) * \
+                                            (self.table_counts_per_doc[current_sample, d]*current_sample_log_prob +
+                                             self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, current_sample])) / \
+                                            (self.table_counts_per_doc[new_sample, d]*new_sample_log_prob +
+                                             self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, new_sample]))
                                 # 3. Compare against uniform[0,1]
                                 # If the acceptance prob > 1, we always accept: this means the new sample
                                 # has a higher probability than the old

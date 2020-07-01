@@ -6,6 +6,8 @@ import re
 import warnings
 
 import numpy as np
+from sklearn.metrics import euclidean_distances
+
 from gaussianlda.prior import Wishart
 from scipy.linalg import solve_triangular
 from scipy.special import gammaln
@@ -62,7 +64,7 @@ class GaussianLDA:
         self.scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
         self.nu = self.prior.nu + self.table_counts - self.embedding_size + 1.
         # We can even scale the cholesky decomposition by scaleTdistrn
-        self.scabled_table_cholesky_ltriangular_mat = \
+        self.scaled_table_cholesky_ltriangular_mat = \
             self.scaleTdistrn[:, np.newaxis, np.newaxis] * self.table_cholesky_ltriangular_mat
 
         self._topic_word_pdf_cache = {}
@@ -103,6 +105,8 @@ class GaussianLDA:
             for i, line in enumerate(f):
                 line = line.rstrip("\n")
                 vocab_embeddings[i, :] = [float(v) for v in line.split()]
+        #non_zero = np.where(np.sum(vocab_embeddings**2., axis=-1) > 0)
+        #vocab_embeddings[non_zero] /= np.sqrt(np.sum(vocab_embeddings[non_zero]**2., axis=-1))[:, np.newaxis]
 
         if output_checks:
             # Sanity check the embeddings and vocab
@@ -113,6 +117,7 @@ class GaussianLDA:
         filenames = os.listdir(path)
         table_params_re = re.compile("\d+\.txt")
         table_params_filenames = [f for f in filenames if re.match(table_params_re, f)]
+        table_params_filenames.sort()
 
         num_tables = len(table_params_filenames)
 
@@ -148,6 +153,11 @@ class GaussianLDA:
             ], dtype=np.float64)
             table_cholesky_ltriangular_mat[table_num, :, :] = chol_mat
 
+        if output_checks:
+            for topic in range(num_tables):
+                topic_nn = np.argsort(-cosine_similarity(table_means[topic].reshape(1, -1), vocab_embeddings)[0])[0]
+                print("Topic {} centroid by cos sim: {}".format(topic, vocab[topic_nn]))
+
         # Load the total counts of customers at each table
         with open(os.path.join(path, "topic_counts.txt"), "r") as f:
             lines = f.readlines()
@@ -162,10 +172,10 @@ class GaussianLDA:
         # Compute this in the same way as the Java code does
         for table in range(num_tables):
             # Log det of cov matrix is 2*log det of chol decomp
-            k_n = table_counts[table] + kappa
-            nu_n = table_counts[table] + nu
-            scale_t_distrn = (k_n + 1.) / (k_n * (nu_n - embedding_size + 1))
-            log_determinants[table] = np.sum(np.log(np.diag(table_cholesky_ltriangular_mat[table, :, :]))) \
+            k_n = float(table_counts[table]) + kappa
+            nu_n = float(table_counts[table]) + nu
+            scale_t_distrn = (k_n + 1.) / (k_n * (nu_n - embedding_size + 1.))
+            log_determinants[table] = np.sum(np.log(np.diagonal(table_cholesky_ltriangular_mat[table, :, :]))) \
                                       + embedding_size * np.log(scale_t_distrn) / 2.
 
         # Initialize a model
@@ -173,6 +183,13 @@ class GaussianLDA:
             vocab_embeddings, vocab, num_tables, alpha, kappa,
             table_counts, table_means, log_determinants, table_cholesky_ltriangular_mat,
         )
+        if output_checks:
+            for table in range(num_tables):
+                print("Computing probs for table {}".format(table))
+                logprob = model.log_multivariate_tdensity(vocab_embeddings, table)
+                top_word_ids = np.argsort(-logprob)
+                top_words = [vocab[i] for i in top_word_ids]
+                print("Top words for table {}: {}".format(table, top_words[:3]))
         return model
 
     @staticmethod
@@ -213,13 +230,11 @@ class GaussianLDA:
                 sample for a table index
         """
         doc_ids = [self.vocab.index(w) for w in doc if w in self.vocab]
-        table_assignments = list(np.random.randint(self.num_tables, size=len(doc)))
+        table_assignments = list(np.random.randint(self.num_tables, size=len(doc_ids)))
         doc_table_counts = np.bincount(table_assignments, minlength=self.num_tables)
 
         for iteration in range(num_iterations):
             for w, cust_id in enumerate(doc_ids):
-                x = self.vocab_embeddings[cust_id]
-
                 # Remove custId from his old_table
                 old_table_id = table_assignments[w]
                 table_assignments[w] = -1  # Doesn't really make any difference, as only counts are used
@@ -260,7 +275,7 @@ class GaussianLDA:
         nu = self.nu[table_id]
         # first calculate (x-mu)
         x_minus_mu = x - self.table_means[table_id]
-        ltriangular_chol = self.scabled_table_cholesky_ltriangular_mat[table_id]
+        ltriangular_chol = self.scaled_table_cholesky_ltriangular_mat[table_id]
         solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum(-1)
@@ -298,7 +313,7 @@ class GaussianLDA:
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(self.scabled_table_cholesky_ltriangular_mat[table], x_minus_mu[table])
+            table_solved = solve_triangular(self.scaled_table_cholesky_ltriangular_mat[table], x_minus_mu[table])
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
