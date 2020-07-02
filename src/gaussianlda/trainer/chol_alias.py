@@ -40,7 +40,7 @@ from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate,
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
                  show_topics=None, mh_steps=2, num_words_for_formatting=None,
-                 das_normalization=True, das_acceptance=False,
+                 replicate_das=False,
                  show_progress=True):
         """
 
@@ -58,11 +58,13 @@ class GaussianLDAAliasTrainer:
             every word in the vocabulary under that topic. This can take a long time for a large vocabulary.
             If given, this limits the number considered to the first
             N in the vocabulary (which makes sense if the vocabulary is ordered with most common words first).
-        :param das_normalization: Use the normalization of probability distributions used by Das, Zaheer and Dyer's
+        :param replicate_das: Use normalization of distributions and acceptance probability calculation as
+            in the original GLDA paper.
+            Use the normalization of probability distributions used by Das, Zaheer and Dyer's
             original implementation when computing the sampling probability to choose whether to use the document
             posterior or language model part of the topic posterior. If False, do not normalize in this way, but use
             an alternative, which looks to me like it's more correct mathematically.
-        :param das_acceptance: Use the acceptance probability calculation exactly as in Das et al.'s Java
+            Use the acceptance probability calculation exactly as in Das et al.'s Java
             implementation. Default behaviour is to use a corrected version of the calculation based on my
             reading of the background literature. For exact comparison to the Java implementation,
             the original formula should be used.
@@ -84,8 +86,7 @@ class GaussianLDAAliasTrainer:
             alpha = 1. / num_tables
         self.alpha = alpha
 
-        self.das_normalization = das_normalization
-        self.das_acceptance = das_acceptance
+        self.replicate_das = replicate_das
 
         # dataVectors
         self.vocab_embeddings = vocab_embeddings
@@ -338,7 +339,7 @@ class GaussianLDAAliasTrainer:
                 self.aliases, self.vocab_embeddings,
                 self.prior.kappa, self.prior.nu,
                 self.table_counts, self.table_means, self.table_cholesky_ltriangular_mat,
-                self.log_determinants, das_normalization=self.das_normalization,
+                self.log_determinants, das_normalization=self.replicate_das,
         ) as alias_updater:
             for iteration in range(num_iterations):
                 stats = SamplingDiagnostics()
@@ -385,7 +386,7 @@ class GaussianLDAAliasTrainer:
                             # To prevent overflow, subtract by log(p_max)
                             max_log_posterior = log_posterior.max()
                             scaled_posterior = log_posterior - max_log_posterior
-                            if self.das_normalization:
+                            if self.replicate_das:
                                 # Not doing this now, but following what the Java impl does, however odd that seems
                                 psum = np.sum(np.exp(scaled_posterior))
                             else:
@@ -428,7 +429,7 @@ class GaussianLDAAliasTrainer:
                                 # This can sometimes generate an overflow warning from Numpy
                                 # We don't care, though: in that case acceptance > 1., so we always accept
                                 with np.errstate(over="ignore"):
-                                    if not self.das_acceptance:
+                                    if not self.replicate_das:
                                         # From my reading of:
                                         # Li et al. (2014): Reducing the sampling complexity of topic models
                                         # the acceptance probability should be as follows:
@@ -489,7 +490,7 @@ class GaussianLDAAliasTrainer:
 
                 # Output some useful stats about sampling
                 if stats.acceptance_used():
-                    self.log.info("Acceptance rate = {:.2f}%, mean acceptance: {:.2f} ({:,} samples draw)".format(
+                    self.log.info("Acceptance rate = {:.2f}%, mean acceptance: {:.2e} ({:,} samples draw)".format(
                         stats.acceptance_rate()*100., stats.mean_acceptance(), stats.acceptance_samples()))
                 else:
                     self.log.info("No new samples drawn")
@@ -717,8 +718,9 @@ class VoseAliasUpdater(Process):
                 # Exp them all to get the new w array
                 w = np.exp(log_likelihoods_scaled)
                 if self.das_normalization:
-                    # Not doing this now, but following what the Java impl does, however odd that seems
+                    # Replicating exactly what the Java code does
                     likelihood_sum = w.sum()
+                    log_likelihoods = log_likelihoods_scaled
                 else:
                     # Sum of likelihood has to be scaled back to its original sum, before we subtracted the max log
                     likelihood_sum = np.exp(np.log(w.sum()) + ll_max)
