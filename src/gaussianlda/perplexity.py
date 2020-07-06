@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg import solve_triangular
 
 
 def corpus_categorical_mean_ll(corpus, table_assignments, table_word_logprobs, check_probs=True):
@@ -41,3 +42,44 @@ def corpus_categorical_mean_ll(corpus, table_assignments, table_word_logprobs, c
             num_words += 1
 
     return total_logprob / num_words
+
+
+def calculate_avg_ll(corpus, table_assignments, embeddings, table_means, table_cholesky_ltriangular_mat, prior, table_counts_per_doc):
+    """
+    Calculates corpus perplexity (avg. log-likelihood)
+
+    Reproduction of Gaussian_LDA's Util.calculateAvgLL(). It's not really perplexity, but
+    the mean LL of the words given the sampled topics.
+
+    """
+    num_tables = table_means.shape[0]
+    embedding_size = embeddings.shape[1]
+    # Sum up the total number of customers per table
+    n_k = table_counts_per_doc.sum(axis=1)
+
+    scalar = n_k + prior.nu - embedding_size
+    # now divide the choleskies by sqrt(scalar)
+    scaled_choleskies = table_cholesky_ltriangular_mat / np.sqrt(scalar)[:, np.newaxis, np.newaxis]
+
+    # logDensity of mulitvariate normal is given by -0.5*(log D + K*log(2*\pi)+(x-\mu)^T\Sigma^-1(x-\mu))
+    # calculate log D for all table from cholesky
+    log_det = np.zeros(num_tables, dtype=np.float64)
+    for table in range(num_tables):
+        log_det[table] = np.sum(np.log(np.diagonal(scaled_choleskies[table])))
+
+    total_log_ll = 0.
+    total_words = 0
+    for doc, tables in zip(corpus, table_assignments):
+        for word, table in zip(doc, tables):
+            # Do exactly what the Java code does
+            x = embeddings[word]
+            x_minus_mu = x - table_means[table]
+            ltriangular_chol = scaled_choleskies[table]
+            solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False, lower=True)
+            val = np.sum(solved ** 2.)
+            log_density = 0.5 * (val + embedding_size * np.log(2. * np.pi)) + log_det[table]
+            total_log_ll -= log_density
+
+            total_words += 1
+
+    return total_log_ll / total_words

@@ -27,14 +27,18 @@ from multiprocessing import Process
 import random
 
 import numpy as np
+import warnings
+
 from gaussianlda.mp_utils import GaussianLock, SharedArray, TwoSidedLock
 from numpy.core.umath import isinf
 from numpy.linalg import slogdet
-from scipy.linalg import solve_triangular
+from scipy.linalg import get_lapack_funcs, solve_triangular
 from scipy.special import gammaln
 
 from gaussianlda.prior import Wishart
-from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update
+from gaussianlda.utils import get_logger, get_progress_bar, chol_rank1_downdate, chol_rank1_update, BatchedRands, \
+    BatchedRandInts
+from gaussianlda.perplexity import calculate_avg_ll
 
 
 class GaussianLDAAliasTrainer:
@@ -129,13 +133,24 @@ class GaussianLDAAliasTrainer:
         # Normal inverse wishart prior
         self.prior = Wishart(self.vocab_embeddings, kappa=kappa)
 
+        # Pre-compute the outer product of each vector with itself
+        self.sqaured_embeddings = np.zeros((self.vocab_embeddings.shape[0], self.embedding_size, self.embedding_size), dtype=np.float64)
+        for v_id in range(self.vocab_embeddings.shape[0]):
+            self.sqaured_embeddings[v_id] = np.outer(self.vocab_embeddings[v_id], self.vocab_embeddings[v_id])
+
         # Cache k_0\mu_0\mu_0^T, only compute it once
         # Used in calculate_table_params()
         self.k0mu0mu0T = self.prior.kappa * np.outer(self.prior.mu, self.prior.mu)
 
+        # We use this a lot
+        self.log_pi = np.log(np.pi)
+
         self.num_words_for_formatting = num_words_for_formatting
 
         self.aliases = VoseAliases.create(self.num_terms, self.num_tables)
+
+        # Speed up random sampling by drawing batches of random numbers at once
+        self.rng = BatchedRands()
 
         self.log.info("Initializing assignments")
         self.initialize()
@@ -174,19 +189,31 @@ class GaussianLDAAliasTrainer:
         for table in range(self.num_tables):
             self.table_cholesky_ltriangular_mat.np[table] = self.prior.chol_sigma.copy()
 
+        # Speed up random samples by drawing batches
+        rng = BatchedRandInts(self.num_tables, batch_size=10000)
+
         # Randomly assign customers to tables
         self.table_assignments = []
         pbar = get_progress_bar(len(self.corpus), title="Initializing", show_progress=self.show_progress)
         for doc_num, doc in enumerate(pbar(self.corpus)):
-            tables = list(np.random.randint(self.num_tables, size=len(doc)))
+            tables = list(rng.integers(len(doc)))
             self.table_assignments.append(tables)
             for (word, table) in zip(doc, tables):
                 self.table_counts.np[table] += 1
                 self.table_counts_per_doc[table, doc_num] += 1
                 # update the sumTableCustomers
-                self.sum_squared_table_customers[table] += np.outer(self.vocab_embeddings[word], self.vocab_embeddings[word])
+                self.sum_squared_table_customers[table] += self.sqaured_embeddings[word]
 
                 self.update_table_params(table, word)
+
+        # Output initial perplexity
+        self.log.info("Computing average LL")
+        ave_ll = calculate_avg_ll(
+            get_progress_bar(len(self.corpus))(self.corpus), self.table_assignments, self.vocab_embeddings,
+            self.table_means.np, self.table_cholesky_ltriangular_mat.np,
+            self.prior, self.table_counts_per_doc
+        )
+        self.log.info("Average LL after initialization: {:.3e}".format(ave_ll))
 
     def update_table_params(self, table_id, cust_id, is_removed=False):
         count = self.table_counts.np[table_id]
@@ -255,25 +282,27 @@ class GaussianLDAAliasTrainer:
 
         count = self.table_counts.np[table_id]
         k_n = self.prior.kappa + count
-        nu_n = self.prior.nu + count
-        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
-        nu = self.prior.nu + count - self.embedding_size + 1.
+        nu_plus_d = self.prior.nu + count + 1.
+        nu = nu_plus_d - self.embedding_size
+        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * nu))
         # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
         # therefore I am gonna use triangular solver
         # first calculate (x-mu)
         x_minus_mu = x - self.table_means.np[table_id]
         # Now scale the lower tringular matrix
         ltriangular_chol = scaleTdistrn * self.table_cholesky_ltriangular_mat.np[table_id]
-        solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
+        # Disabling the finiteness check speeds things up
+        #solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False, lower=True)
+        solved = _fast_solve_triangular(ltriangular_chol, x_minus_mu)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum(-1)
 
-        logprob = gammaln((nu + self.embedding_size) / 2.) - \
+        logprob = gammaln(nu_plus_d / 2.) - \
                   (
                           gammaln(nu / 2.) +
-                          self.embedding_size / 2. * (np.log(nu) + np.log(math.pi)) +
+                          self.embedding_size / 2. * (np.log(nu) + self.log_pi) +
                           self.log_determinants.np[table_id] +
-                          (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
+                          nu_plus_d / 2. * np.log(1. + val / nu)
                   )
         return logprob
 
@@ -285,9 +314,9 @@ class GaussianLDAAliasTrainer:
         """
         count = self.table_counts.np
         k_n = self.prior.kappa + count
-        nu_n = self.prior.nu + count
-        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * (nu_n - self.embedding_size + 1.)))
-        nu = self.prior.nu + count - self.embedding_size + 1.
+        nu_plus_d = self.prior.nu + count + 1.
+        nu = nu_plus_d - self.embedding_size
+        scaleTdistrn = np.sqrt((k_n + 1.) / (k_n * nu))
         # Since I am storing lower triangular matrices, it is easy to calculate (x-\mu)^T\Sigma^-1(x-\mu)
         # therefore I am gonna use triangular solver first calculate (x-mu)
         x_minus_mu = x[None, :] - self.table_means.np
@@ -296,16 +325,17 @@ class GaussianLDAAliasTrainer:
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
+            #table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False, lower=True)
+            table_solved = _fast_solve_triangular(ltriangular_chol[table], x_minus_mu[table])
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
-        logprob = gammaln((nu + self.embedding_size) / 2.) - \
+        logprob = gammaln(nu_plus_d / 2.) - \
                   (
                           gammaln(nu / 2.) +
-                          self.embedding_size / 2. * (np.log(nu) + np.log(math.pi)) +
+                          self.embedding_size / 2. * (np.log(nu) + self.log_pi) +
                           self.log_determinants.np +
-                          (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
+                          nu_plus_d / 2. * np.log(1. + val / nu)
                   )
         return logprob
 
@@ -335,6 +365,9 @@ class GaussianLDAAliasTrainer:
             print("Docs using topics: {}".format(
                 ", ".join("{}={:.1f}%".format(i, prop) for i, prop in enumerate(topic_doc_props*100.))))
 
+        # Batch random samples to speed up sampling
+        rng = BatchedRands()
+
         with VoseAliasUpdater(
                 self.aliases, self.vocab_embeddings,
                 self.prior.kappa, self.prior.nu,
@@ -362,11 +395,14 @@ class GaussianLDAAliasTrainer:
                             self.table_counts.np[old_table_id] -= 1
                         self.table_counts_per_doc[old_table_id, d] -= 1
                         # Update vector means etc
-                        self.sum_squared_table_customers[old_table_id] -= np.outer(x, x)
+                        self.sum_squared_table_customers[old_table_id] -= self.sqaured_embeddings[cust_id]
 
                         # Topic 'old_table_id' now has one member fewer
                         # Just update params for this customer
                         self.update_table_params(old_table_id, cust_id, is_removed=True)
+
+                        # Cache log density calculations to avoid repeated (expensive) computations
+                        densities = LogDensityCache(self, x)
 
                         # Under the alias method, we only do the full likelihood computation for topics
                         # that already have a non-zero count in the current document
@@ -380,7 +416,7 @@ class GaussianLDAAliasTrainer:
                             log_priors = np.log(self.table_counts_per_doc[non_zero_tables, d])
                             log_likelihoods = np.zeros(len(non_zero_tables), dtype=np.float32)
                             for nz_table, table in enumerate(non_zero_tables):
-                                log_likelihoods[nz_table] = self.log_multivariate_tdensity(x, table)
+                                log_likelihoods[nz_table] = densities.logprob(table)
                             log_posterior = log_priors + log_likelihoods
 
                             # To prevent overflow, subtract by log(p_max)
@@ -398,9 +434,13 @@ class GaussianLDAAliasTrainer:
                             # but we simply normalize and use Numpy to sample
                             unnormed_posterior = np.exp(scaled_posterior)
                             normed_posterior = unnormed_posterior / unnormed_posterior.sum()
+                            normed_posterior_cum = np.cumsum(normed_posterior)
 
                         # Don't let the alias parameters get updated in the middle of the sampling
                         self.aliases.lock.acquire_read(cust_id)
+                        # If replicate_das is set, psum and likelihood_sum are scaled by different factors,
+                        #  which I'm pretty sure is wrong
+                        # I have checked that we are getting very similar values for select_pr to the Java impl
                         select_pr = psum / (psum + self.alpha*self.aliases.likelihood_sum.np[cust_id])
 
                         # MHV to draw new topic
@@ -408,13 +448,13 @@ class GaussianLDAAliasTrainer:
                         current_sample = old_table_id
                         # Calculate the true likelihood of this word under the current sample,
                         # for calculating acceptance prob
-                        current_sample_log_prob = self.log_multivariate_tdensity(x, current_sample)
+                        current_sample_log_prob = densities.logprob(current_sample)
                         for r in range(self.mh_steps):
                             # 1. Flip a coin
-                            if not no_non_zero and np.random.sample() < select_pr:
+                            if not no_non_zero and rng.random() < select_pr:
                                 # Choose from the exactly computed posterior dist, only allowing
                                 # topics already sampled in the doc
-                                temp = np.random.choice(len(non_zero_tables), p=normed_posterior)
+                                temp = rng.choice_cum(normed_posterior_cum)
                                 new_sample = non_zero_tables[temp]
                                 stats.log_select_pr(True, select_pr)
                             else:
@@ -425,7 +465,7 @@ class GaussianLDAAliasTrainer:
 
                             if new_sample != current_sample:
                                 # 2. Find acceptance probability
-                                new_sample_log_prob = self.log_multivariate_tdensity(x, new_sample)
+                                new_sample_log_prob = densities.logprob(new_sample)
                                 # This can sometimes generate an overflow warning from Numpy
                                 # We don't care, though: in that case acceptance > 1., so we always accept
                                 with np.errstate(over="ignore"):
@@ -444,7 +484,12 @@ class GaussianLDAAliasTrainer:
                                         # The difference is the Java impl doesn't exp the log likelihood in the last
                                         # fraction, i.e. it uses a log prob instead of a prob
                                     else:
-                                        # The Java implementation, however, does this:
+                                        # The Java implementation, however, does this
+                                        # Note that log_likelihoods[cust_id] stores the log of what is
+                                        #  in w in the Java impl, so we exp it here to make this identical
+                                        # I have checked that this is behaving in a way very similar to the
+                                        #  Java version, producing the same sort of values and getting more extreme
+                                        #  values as the first iteration goes on
                                         acceptance = \
                                             (self.table_counts_per_doc[new_sample, d] + self.alpha) / \
                                             (self.table_counts_per_doc[current_sample, d] + self.alpha) * \
@@ -453,6 +498,7 @@ class GaussianLDAAliasTrainer:
                                              self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, current_sample])) / \
                                             (self.table_counts_per_doc[new_sample, d]*new_sample_log_prob +
                                              self.alpha*np.exp(self.aliases.log_likelihoods.np[cust_id, new_sample]))
+
                                 # 3. Compare against uniform[0,1]
                                 # If the acceptance prob > 1, we always accept: this means the new sample
                                 # has a higher probability than the old
@@ -481,12 +527,21 @@ class GaussianLDAAliasTrainer:
                         with self.table_counts.lock:
                             self.table_counts.np[current_sample] += 1
                         self.table_counts_per_doc[current_sample, d] += 1
-                        self.sum_squared_table_customers[current_sample] += np.outer(x, x)
+                        self.sum_squared_table_customers[current_sample] += self.sqaured_embeddings[cust_id]
 
                         self.update_table_params(current_sample, cust_id)
 
                 # Pause the alias updater until we start the next iteration
                 alias_updater.pause()
+
+                # Compute and output average LL
+                self.log.info("Computing average LL")
+                ave_ll = calculate_avg_ll(
+                    get_progress_bar(len(self.corpus))(self.corpus), self.table_assignments, self.vocab_embeddings,
+                    self.table_means.np, self.table_cholesky_ltriangular_mat.np,
+                    self.prior, self.table_counts_per_doc
+                )
+                self.log.info("Average LL: {:.3e}".format(ave_ll))
 
                 # Output some useful stats about sampling
                 if stats.acceptance_used():
@@ -600,7 +655,8 @@ class VoseAliases:
         self.log_likelihoods = log_likelihoods
         self.likelihood_sum = likelihood_sum
 
-        self.gen = random.Random()
+        #self.gen = random.Random()
+        self.gen = BatchedRands()
 
         self.lock = lock
 
@@ -622,7 +678,8 @@ class VoseAliases:
 
     def sample_vose(self, word):
         # 1. Generate a fair die roll from an n-sided die
-        fair_die = self.gen.randint(0, self.n-1)
+        #fair_die = self.gen.randint(0, self.n-1)
+        fair_die = self.gen.integer(self.n)
         # 2. Flip a biased coin that comes up heads with probability Prob[i]
         m = self.gen.random()
         # 3. If the coin comes up "heads," return i. Otherwise, return Alias[i]
@@ -709,17 +766,19 @@ class VoseAliasUpdater(Process):
             for term_id, x in enumerate(self.embeddings):
                 # Compute the likelihood under each possible topic assignment
                 log_likelihoods = self.log_multivariate_tdensity_tables(x)
-                # To prevent overflow, subtract by log(p_max).
-                # This is because when we will be normalizing after exponentiating, each entry will be
-                # exp(log p_i - log p_max )/\Sigma_i exp(log p_i - log p_max)
-                # The log p_max cancels put and prevents overflow in the exponentiating phase
+                # To prevent overflow, subtract by log(p_max)
+                # This is because when we will be normalizing after exponentiating
                 ll_max = log_likelihoods.max()
                 log_likelihoods_scaled = log_likelihoods - ll_max
                 # Exp them all to get the new w array
                 w = np.exp(log_likelihoods_scaled)
                 if self.das_normalization:
                     # Replicating exactly what the Java code does
+                    # The sum that is used is scaled by the max, which is odd
+                    # This value is used to compute select_pr
                     likelihood_sum = w.sum()
+                    # We store in log_likelihoods[term] the scaled version of the LL
+                    # In the Java impl, this is exp'd and stored in w
                     log_likelihoods = log_likelihoods_scaled
                 else:
                     # Sum of likelihood has to be scaled back to its original sum, before we subtracted the max log
@@ -832,7 +891,8 @@ class VoseAliasUpdater(Process):
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
+            #table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False, lower=True)
+            table_solved = _fast_solve_triangular(ltriangular_chol[table], x_minus_mu[table])
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
@@ -868,7 +928,8 @@ class VoseAliasUpdater(Process):
         x_minus_mu = x - table_mean
         # Now scale the lower tringular matrix
         ltriangular_chol = scaleTdistrn * table_cholesky_ltriangular_mat
-        solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False)
+        #solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False, lower=True)
+        solved = _fast_solve_triangular(ltriangular_chol, x_minus_mu)
         # Now take xTx (dot product)
         val = (solved ** 2.).sum()
 
@@ -905,7 +966,8 @@ class VoseAliasUpdater(Process):
         # We can't do solve_triangular for all matrices at once in scipy
         val = np.zeros(self.num_tables, dtype=np.float64)
         for table in range(self.num_tables):
-            table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False)
+            #table_solved = solve_triangular(ltriangular_chol[table], x_minus_mu[table], check_finite=False, lower=True)
+            table_solved = _fast_solve_triangular(ltriangular_chol[table], x_minus_mu[table])
             # Now take xTx (dot product)
             val[table] = (table_solved ** 2.).sum()
 
@@ -917,6 +979,26 @@ class VoseAliasUpdater(Process):
                           (nu + self.embedding_size) / 2. * np.log(1. + val / nu)
                   )
         return logprob
+
+
+# Calling scipy's solve_triangular results in a lookup of the relevant
+#  LAPACK function every time. Since we need to call it so many times and always
+#  use the same internal function, force the lookup on load and use the funciton directly
+trtrs, = get_lapack_funcs(('trtrs',))
+
+def _fast_solve_triangular(a, b):
+    try:
+        x, info = trtrs(a, b, overwrite_b=False, lower=True, trans=0, unitdiag=False)
+    except Exception as e:
+        warnings.warn("error calling trtrs, trying again with solve_triangular: {}".format(e))
+        solve_triangular(a, b, check_finite=True, lower=True)
+        raise
+
+    if info == 0:
+        return x
+    if info > 0:
+        raise ValueError("solve_triangular error: singular matrix: resolution failed at diagonal %d" % (info-1))
+    raise ValueError("solve_triangular error: illegal value in %d-th argument of internal trtrs" % (-info))
 
 
 class SamplingDiagnostics:
@@ -976,3 +1058,24 @@ class SamplingDiagnostics:
 
     def sample_change_rate(self):
         return float(self._resampled_different) / self._resampled_total
+
+
+class LogDensityCache:
+    """
+    Computing the log density of a given table for a given embedding is one
+    of the most expensive operations in the sampling process. We speed things
+    up by cacheing the values, within a single word-topic sample (i.e. while the
+    parameters are kept fixed).
+
+    """
+    def __init__(self, trainer, x):
+        self.x = x
+        self.trainer = trainer
+        self._cache = {}
+
+    def logprob(self, table):
+        try:
+            return self._cache[table]
+        except KeyError:
+            self._cache[table] = self.trainer.log_multivariate_tdensity(self.x, table)
+            return self._cache[table]

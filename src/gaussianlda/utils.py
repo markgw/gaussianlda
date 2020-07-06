@@ -2,6 +2,7 @@ import logging
 import progressbar as pb
 
 import numpy as np
+from numpy.random import default_rng
 
 from choldate import cholupdate, choldowndate
 
@@ -84,3 +85,73 @@ def sum_logprobs(logprobs):
     """
     max_prob = logprobs.max()
     return np.log(np.sum(np.exp(logprobs - max_prob))) + max_prob
+
+
+class BatchedRands:
+    """
+    Draw multiple random samples from Numpy at once to speed up repeated
+    random sampling.
+
+    Change how many are drawn at once by setting batch_size. Very small
+    numbers (<10) will be very slow, like just drawing repeated samples. Numbers
+    more like 100 will be better. 1000 probably gives a small speedup, but beyond
+    that there's not much difference.
+
+    """
+    def __init__(self, batch_size=1000):
+        self.batch_size = batch_size
+        self.rng = default_rng()
+        self._it = iter(self)
+
+    def __iter__(self):
+        while True:
+            batch = self.rng.random(self.batch_size)
+            for v in batch:
+                yield v
+
+    def random(self):
+        return next(self._it)
+
+    def integer(self, high):
+        return int(high * self.random())
+
+    def choice(self, p):
+        rand = self.random()
+        return np.argmax(np.cumsum(p) > rand)
+
+    def choice_cum(self, p):
+        """
+        Like choice, but probabilities are given in cumulative form. This is useful
+        if you need to draw several times from the same dist, to avoid recomputing
+        the cumsum. For a large number of samples, this can give a largeish speedup
+        (like 2x).
+
+        """
+        rand = self.random()
+        return np.argmax(p > rand)
+
+
+class BatchedRandInts:
+    """
+    Similar to BatchedRands, but generates arrays of integers. The size of the
+    arrays varies, but the range of the integers is fixed.
+
+    """
+    def __init__(self, high, batch_size=1000):
+        self.high = high
+        self.batch_size = batch_size
+        self.rng = default_rng()
+        self._new_batch()
+
+    def _new_batch(self):
+        self._current_id = 0
+        self._batch = self.rng.integers(self.high, size=self.batch_size)
+
+    def integers(self, size):
+        self._current_id += size
+        if self._current_id > self.batch_size:
+            # Reached end of batch in middle of range
+            self._new_batch()
+            self._current_id += size
+
+        return self._batch[self._current_id-size:self._current_id]
