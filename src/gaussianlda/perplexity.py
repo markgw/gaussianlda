@@ -67,19 +67,27 @@ def calculate_avg_ll(corpus, table_assignments, embeddings, table_means, table_c
     for table in range(num_tables):
         log_det[table] = np.sum(np.log(np.diagonal(scaled_choleskies[table])))
 
+    # Cache the table-word pairs' log densities to speed this up
+    log_density_cache = {}
+
     total_log_ll = 0.
     total_words = 0
     for doc, tables in zip(corpus, table_assignments):
         for word, table in zip(doc, tables):
-            # Do exactly what the Java code does
-            x = embeddings[word]
-            x_minus_mu = x - table_means[table]
-            ltriangular_chol = scaled_choleskies[table]
-            solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False, lower=True)
-            val = np.sum(solved ** 2.)
-            log_density = 0.5 * (val + embedding_size * np.log(2. * np.pi)) + log_det[table]
-            total_log_ll -= log_density
+            if (table, word) in log_density_cache:
+                log_density = log_density_cache[(table, word)]
+            else:
+                # Do exactly what the Java code does
+                x = embeddings[word]
+                x_minus_mu = x - table_means[table]
+                ltriangular_chol = scaled_choleskies[table]
+                solved = solve_triangular(ltriangular_chol, x_minus_mu, check_finite=False, lower=True)
+                val = np.sum(solved ** 2.)
+                log_density = 0.5 * (val + embedding_size * np.log(2. * np.pi)) + log_det[table]
 
+                log_density_cache[(table, word)] = log_density
+
+            total_log_ll -= log_density
             total_words += 1
 
     return total_log_ll / total_words

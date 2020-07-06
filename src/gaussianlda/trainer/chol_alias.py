@@ -368,6 +368,9 @@ class GaussianLDAAliasTrainer:
         # Batch random samples to speed up sampling
         rng = BatchedRands()
 
+        # Cache log density calculations to avoid repeated (expensive) computations
+        densities = LogDensityCache(self, self.num_tables)
+
         with VoseAliasUpdater(
                 self.aliases, self.vocab_embeddings,
                 self.prior.kappa, self.prior.nu,
@@ -400,9 +403,7 @@ class GaussianLDAAliasTrainer:
                         # Topic 'old_table_id' now has one member fewer
                         # Just update params for this customer
                         self.update_table_params(old_table_id, cust_id, is_removed=True)
-
-                        # Cache log density calculations to avoid repeated (expensive) computations
-                        densities = LogDensityCache(self, x)
+                        densities.clear(old_table_id)
 
                         # Under the alias method, we only do the full likelihood computation for topics
                         # that already have a non-zero count in the current document
@@ -416,7 +417,7 @@ class GaussianLDAAliasTrainer:
                             log_priors = np.log(self.table_counts_per_doc[non_zero_tables, d])
                             log_likelihoods = np.zeros(len(non_zero_tables), dtype=np.float32)
                             for nz_table, table in enumerate(non_zero_tables):
-                                log_likelihoods[nz_table] = densities.logprob(table)
+                                log_likelihoods[nz_table] = densities.logprob(cust_id, x, table)
                             log_posterior = log_priors + log_likelihoods
 
                             # To prevent overflow, subtract by log(p_max)
@@ -448,7 +449,7 @@ class GaussianLDAAliasTrainer:
                         current_sample = old_table_id
                         # Calculate the true likelihood of this word under the current sample,
                         # for calculating acceptance prob
-                        current_sample_log_prob = densities.logprob(current_sample)
+                        current_sample_log_prob = densities.logprob(cust_id, x, current_sample)
                         for r in range(self.mh_steps):
                             # 1. Flip a coin
                             if not no_non_zero and rng.random() < select_pr:
@@ -465,7 +466,7 @@ class GaussianLDAAliasTrainer:
 
                             if new_sample != current_sample:
                                 # 2. Find acceptance probability
-                                new_sample_log_prob = densities.logprob(new_sample)
+                                new_sample_log_prob = densities.logprob(cust_id, x, new_sample)
                                 # This can sometimes generate an overflow warning from Numpy
                                 # We don't care, though: in that case acceptance > 1., so we always accept
                                 with np.errstate(over="ignore"):
@@ -530,6 +531,7 @@ class GaussianLDAAliasTrainer:
                         self.sum_squared_table_customers[current_sample] += self.sqaured_embeddings[cust_id]
 
                         self.update_table_params(current_sample, cust_id)
+                        densities.clear(current_sample)
 
                 # Pause the alias updater until we start the next iteration
                 alias_updater.pause()
@@ -1068,14 +1070,18 @@ class LogDensityCache:
     parameters are kept fixed).
 
     """
-    def __init__(self, trainer, x):
-        self.x = x
+    def __init__(self, trainer, num_tables):
         self.trainer = trainer
         self._cache = {}
+        for table in range(num_tables):
+            self._cache[table] = {}
 
-    def logprob(self, table):
+    def clear(self, table):
+        self._cache[table] = {}
+
+    def logprob(self, word_id, x, table):
         try:
-            return self._cache[table]
+            return self._cache[table][word_id]
         except KeyError:
-            self._cache[table] = self.trainer.log_multivariate_tdensity(self.x, table)
-            return self._cache[table]
+            self._cache[table][word_id] = self.trainer.log_multivariate_tdensity(x, table)
+            return self._cache[table][word_id]
