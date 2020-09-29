@@ -44,8 +44,8 @@ from gaussianlda.perplexity import calculate_avg_ll
 class GaussianLDAAliasTrainer:
     def __init__(self, corpus, vocab_embeddings, vocab, num_tables, alpha=None, kappa=0.1, log=None, save_path=None,
                  show_topics=None, mh_steps=2, num_words_for_formatting=None,
-                 replicate_das=False,
-                 show_progress=True):
+                 replicate_das=False, show_progress=True,
+                 initializer=None):
         """
 
         :param corpus:
@@ -72,6 +72,9 @@ class GaussianLDAAliasTrainer:
             implementation. Default behaviour is to use a corrected version of the calculation based on my
             reading of the background literature. For exact comparison to the Java implementation,
             the original formula should be used.
+        :param initializer: By default, topics are randomly initialized. Use this to apply a different
+            initialization scheme. If given, should be a function that takes two arguments - doc num and
+            doc ids - and returns a list of topic IDs to initialize that document to.
         """
         if log is None:
             log = get_logger("GLDA")
@@ -153,6 +156,7 @@ class GaussianLDAAliasTrainer:
         self.rng = BatchedRands()
 
         self.log.info("Initializing assignments")
+        self.initializer = initializer
         self.initialize()
 
     def initialize(self):
@@ -196,7 +200,14 @@ class GaussianLDAAliasTrainer:
         self.table_assignments = []
         pbar = get_progress_bar(len(self.corpus), title="Initializing", show_progress=self.show_progress)
         for doc_num, doc in enumerate(pbar(self.corpus)):
-            tables = list(rng.integers(len(doc)))
+            if self.initializer is None:
+                # Default, random initialization
+                tables = list(rng.integers(len(doc)))
+            else:
+                # Custom initializer provided
+                # Use it to get topics for this document
+                tables = self.initializer(doc_num, doc)
+
             self.table_assignments.append(tables)
             for (word, table) in zip(doc, tables):
                 self.table_counts.np[table] += 1
