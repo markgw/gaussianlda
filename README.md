@@ -100,3 +100,22 @@ from gaussianlda.model import GaussianLDA
 
 model = GaussianLDA.load(output_dir)
 ```
+
+This class allows you to perform subsequent inference on new documents, 
+without updating the model parameters.
+
+You can perform inference on a document using:
+```python
+doc = ["sheep", "cow", "bank", "flibble", "sheep", "pig"]
+iterations = 100
+topics = model.sample(doc, iterations)
+```
+`doc` is a single list of tokens representing a document.
+The returned topics is a list giving the topic assigned to each word.
+
+Be aware that any out-of-vocabulary words in `doc` will be ignored, so the topics in 
+`topics` will match up with the list of words _after_ removing OOVs, not necessarily 
+the doc given. In the example above, the word `"flibble"` will be ignored, so there will 
+only be 5 topics in the returned list.
+
+It's safest to filter out OOVs yourself before calling `sample()`.

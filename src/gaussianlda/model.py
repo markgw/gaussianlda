@@ -219,7 +219,7 @@ class GaussianLDA:
         """
         Run Gibbs sampler on a single document without updating global parameters.
 
-        Input document should be a list of word strings.
+        Input document should be a list of word strings, or a list of integer word IDs.
 
         for num_iters:
             for each customer
@@ -229,7 +229,13 @@ class GaussianLDA:
                 Calculate prior and likelihood for this customer sitting at each table
                 sample for a table index
         """
-        doc_ids = [self.vocab.index(w) for w in doc if w in self.vocab]
+        if len(doc) == 0:
+            return []
+        if type(doc[0]) is int:
+            # Words are already mapped to IDs
+            doc_ids = doc
+        else:
+            doc_ids = [self.vocab.index(w) for w in doc if w in self.vocab]
         table_assignments = list(np.random.randint(self.num_tables, size=len(doc_ids)))
         doc_table_counts = np.bincount(table_assignments, minlength=self.num_tables)
 
