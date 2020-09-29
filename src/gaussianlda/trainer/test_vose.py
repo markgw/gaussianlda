@@ -1,3 +1,9 @@
+"""
+Some tests for the Vose alias sampler to confirm that it's behaving as it should.
+
+Used for debugging only.
+
+"""
 import numpy as np
 
 
