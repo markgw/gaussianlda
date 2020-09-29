@@ -118,4 +118,9 @@ Be aware that any out-of-vocabulary words in `doc` will be ignored, so the topic
 the doc given. In the example above, the word `"flibble"` will be ignored, so there will 
 only be 5 topics in the returned list.
 
-It's safest to filter out OOVs yourself before calling `sample()`.
+Alternatively, specify a document as a list of word IDs, mapped according 
+to the training vocabulary. So the follow is equivalent to the above:
+```python
+doc = [4, 5, 2, 4, 7]
+topics = model.sample(doc, 100)
+```
