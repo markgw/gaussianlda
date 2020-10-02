@@ -215,32 +215,49 @@ class GaussianLDA:
         )
         return model
 
-    def sample(self, doc, num_iterations):
+    def sample(self, doc, num_iterations, oovs_as_nones=False):
         """
         Run Gibbs sampler on a single document without updating global parameters.
 
-        Input document should be a list of word strings, or a list of integer word IDs.
+        The doc is given as a list of tokens.
+        Each token can be the following:
 
-        for num_iters:
-            for each customer
-                remove him from his old_table and update the table params.
-                if old_table is empty:
-                    remove table
-                Calculate prior and likelihood for this customer sitting at each table
-                sample for a table index
+        - a string: if this is in the training vocab, it will be mapped to its ID,
+           otherwise it will be treated as an unknown word (and get topic/concept None);
+        - an int: represents the vocab ID of a word in the training vocabulary, for
+           which the original embedding will be used;
+        - a 1D number array: gives an embedding for this token explicitly, which can
+           be for tokens not in the original training vocab.
+
+        By default, any unknown words are simply removed, so topics are only returned
+        for known words. This can make it difficult to match up topics with the
+        input words.
+        If `oovs_as_nones==True`, Nones are included in the list of topics where an input
+        word was unknown.
+
         """
         if len(doc) == 0:
             return []
-        if type(doc[0]) is int:
-            # Words are already mapped to IDs
-            doc_ids = doc
-        else:
-            doc_ids = [self.vocab.index(w) for w in doc if w in self.vocab]
-        table_assignments = list(np.random.randint(self.num_tables, size=len(doc_ids)))
+
+        # Check whether the doc is specified using words or word ids
+        doc = [
+            token if isinstance(token, np.ndarray)  # Embedding given explicitly
+            or type(token) is int                   # Term ID in training vocab
+            else self.vocab.index(token) if token in self.vocab  # Known word: map to ID
+            else None                               # Unknown word: don't try to analyse
+            for token in doc
+        ]
+        # Note where unknown words are, so we can indicate unknown topics/concepts in the result
+        unknown_word_locs = [i for i, word in enumerate(doc) if word is None]
+        # Now remove Nones from the doc and only analyse the words either in the vocab or with explicit vectors
+        # Now all words are either IDs or vectors
+        doc = [word for word in doc if word is not None]
+
+        table_assignments = list(np.random.randint(self.num_tables, size=len(doc)))
         doc_table_counts = np.bincount(table_assignments, minlength=self.num_tables)
 
         for iteration in range(num_iterations):
-            for w, cust_id in enumerate(doc_ids):
+            for w, cust_id_or_vec in enumerate(doc):
                 # Remove custId from his old_table
                 old_table_id = table_assignments[w]
                 table_assignments[w] = -1  # Doesn't really make any difference, as only counts are used
@@ -250,7 +267,7 @@ class GaussianLDA:
                 # Go over each table
                 counts = doc_table_counts[:] + self.alpha
                 # Now calculate the likelihood for each table
-                log_lls = self.log_multivariate_tdensity_tables(cust_id)
+                log_lls = self.log_multivariate_tdensity_tables(cust_id_or_vec)
                 # Add log prior in the posterior vector
                 log_posteriors = np.log(counts) + log_lls
                 # To prevent overflow, subtract by log(p_max).
@@ -265,6 +282,12 @@ class GaussianLDA:
                 # Now have a new assignment: add its counts
                 doc_table_counts[new_table_id] += 1
                 table_assignments[w] = new_table_id
+
+        if oovs_as_nones:
+            for idx in unknown_word_locs:
+                # Put None into the lists where the input word wasn't known, so we can easily
+                #  match up the topics/concepts with the input words
+                table_assignments.insert(idx, None)
         return table_assignments
 
     def log_multivariate_tdensity(self, x, table_id):
