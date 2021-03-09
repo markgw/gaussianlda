@@ -635,6 +635,7 @@ class GaussianLDAAliasTrainer:
             ("sum_squared_table_customers", self.sum_squared_table_customers),
             ("table_cholesky_ltriangular_mat", self.table_cholesky_ltriangular_mat.np),
             ("vocab_embeddings", self.vocab_embeddings),
+            ("table_counts_per_doc", self.table_counts_per_doc),
         ]:
             with open(os.path.join(self.save_path, "{}.pkl".format(name)), "wb") as f:
                 pickle.dump(data, f)
