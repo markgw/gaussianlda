@@ -363,6 +363,11 @@ class GaussianLDAAliasTrainer:
                     don't have to update the parameters
                 else update params of the old table.
         """
+
+        avg_ll_list = []
+        conv_threshold = 0.01
+        conv_wait_cnt = 10
+
         if self.show_topics is not None:
             print("Topics after initialization")
             print(self.format_topics())
@@ -389,6 +394,22 @@ class GaussianLDAAliasTrainer:
                 self.log_determinants, das_normalization=self.replicate_das,
         ) as alias_updater:
             for iteration in range(num_iterations):
+
+                conv_stop_flag = False
+                if len(avg_ll_list) > conv_wait_cnt:
+                    cur_iter = len(avg_ll_list)-1
+
+                    for idx in range(conv_wait_cnt):
+                        if abs(avg_ll_list[cur_iter-idx] - avg_ll_list[cur_iter-idx-1]) > conv_threshold:
+                            break
+
+                        if idx == conv_wait_cnt-1:
+                            conv_stop_flag = True
+                
+                if conv_stop_flag:
+                    print(f"\n\n Average LL value has not changed much from last {conv_wait_cnt} iterations \n\n")
+                    break
+
                 stats = SamplingDiagnostics()
                 self.log.info("Iteration {}".format(iteration))
 
@@ -554,6 +575,7 @@ class GaussianLDAAliasTrainer:
                     self.table_means.np, self.table_cholesky_ltriangular_mat.np,
                     self.prior, self.table_counts_per_doc
                 )
+                avg_ll_list.append(ave_ll)
                 self.log.info("Average LL: {:.3e}".format(ave_ll))
 
                 # Output some useful stats about sampling
