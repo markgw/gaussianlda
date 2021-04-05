@@ -350,7 +350,7 @@ class GaussianLDAAliasTrainer:
                   )
         return logprob
 
-    def sample(self, num_iterations):
+    def sample(self, num_iterations, conv_wait_cnt = 10):
         """
         for num_iters:
             for each customer
@@ -366,7 +366,7 @@ class GaussianLDAAliasTrainer:
 
         avg_ll_list = []
         conv_threshold = 0.01
-        conv_wait_cnt = 10
+        
 
         if self.show_topics is not None:
             print("Topics after initialization")
