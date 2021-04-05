@@ -100,7 +100,7 @@ class BatchedRands:
     """
     def __init__(self, batch_size=1000):
         self.batch_size = batch_size
-        self.rng = default_rng()
+        self.rng = default_rng(1234)
         self._it = iter(self)
 
     def __iter__(self):
@@ -140,7 +140,7 @@ class BatchedRandInts:
     def __init__(self, high, batch_size=1000):
         self.high = high
         self.batch_size = batch_size
-        self.rng = default_rng()
+        self.rng = default_rng(1234)
         self._new_batch()
 
     def _new_batch(self):
